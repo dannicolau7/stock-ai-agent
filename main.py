@@ -29,6 +29,8 @@ import uvicorn
 
 import config
 from graph import GRAPH, make_initial_state
+import watchlist_manager as wl
+import logger
 
 
 # ── CLI args ───────────────────────────────────────────────────────────────────
@@ -39,11 +41,29 @@ def _parse_args():
     p.add_argument("--interval", type=int, default=300, help="Scan interval seconds (default 300 = 5 min)")
     p.add_argument("--paper",    action="store_true",   help="Paper trading — no real SMS/push alerts")
     p.add_argument("--port",     type=int, default=8000, help="Dashboard port (default 8000)")
+    # Watchlist management (these exit immediately without starting the server)
+    p.add_argument("--add",    metavar="TICKER", default=None, help="Add ticker to watchlist and exit")
+    p.add_argument("--remove", metavar="TICKER", default=None, help="Remove ticker from watchlist and exit")
+    p.add_argument("--list",   action="store_true",            help="List watchlist tickers and exit")
     args, _ = p.parse_known_args()
     return args
 
 _args    = _parse_args()
-TICKER   = _args.ticker or config.TICKER
+
+# ── Handle watchlist management commands immediately (no server needed) ────────
+if _args.add:
+    wl.add(_args.add)
+    raise SystemExit(0)
+if _args.remove:
+    wl.remove(_args.remove)
+    raise SystemExit(0)
+if _args.list:
+    wl.list_tickers()
+    raise SystemExit(0)
+
+# Resolve active ticker: CLI flag → .env → first watchlist entry
+_watchlist = wl.load()
+TICKER   = _args.ticker or config.TICKER or (_watchlist[0] if _watchlist else "BZAI")
 INTERVAL = _args.interval
 PAPER    = _args.paper
 PORT     = _args.port
@@ -137,6 +157,8 @@ def _update_signal_memory(result: dict):
             "confidence": result.get("confidence", 0),
             "timestamp":  datetime.now().isoformat(),
         })
+        # Persist signal to CSV log
+        logger.log_signal(result)
 
 
 def _check_exits(ticker: str, price: float) -> str | None:
@@ -223,7 +245,13 @@ async def monitoring_loop():
     global report_sent_date
     mode = "📋 PAPER" if PAPER else "🔴 LIVE"
     print(f"🚀 Stock AI Agent starting  [{mode}]  ticker={TICKER}  interval={INTERVAL}s")
-    print(f"📊 Dashboard → http://localhost:{PORT}\n")
+    print(f"📊 Dashboard → http://localhost:{PORT}")
+
+    # Print watchlist on startup
+    saved = wl.load()
+    if saved:
+        print(f"📋 Watchlist: {', '.join(saved)}")
+    print()
 
     while True:
         try:
@@ -327,6 +355,30 @@ async def api_watchlist():
 async def api_trigger_run():
     asyncio.create_task(run_once())
     return {"status": "triggered", "ticker": TICKER}
+
+
+@app.get("/api/log")
+async def api_log():
+    """Return last 100 rows of signals_log.csv for the dashboard."""
+    return JSONResponse({"log": logger.read_log(limit=100)})
+
+
+@app.get("/api/watchlist/saved")
+async def api_watchlist_saved():
+    """Return the persisted watchlist.json tickers."""
+    return JSONResponse({"tickers": wl.load()})
+
+
+@app.post("/api/watchlist/add/{ticker}")
+async def api_watchlist_add(ticker: str):
+    updated = wl.add(ticker.upper())
+    return {"tickers": updated}
+
+
+@app.delete("/api/watchlist/remove/{ticker}")
+async def api_watchlist_remove(ticker: str):
+    updated = wl.remove(ticker.upper())
+    return {"tickers": updated}
 
 
 if __name__ == "__main__":

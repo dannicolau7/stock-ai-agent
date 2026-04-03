@@ -4,7 +4,7 @@ Respects paper_trading flag (logs only, no real alerts).
 Only fires when should_alert is True.
 """
 
-from alerts import send_signal_alert
+from alerts import send_alert
 
 
 def alert_node(state: dict) -> dict:
@@ -33,9 +33,34 @@ def alert_node(state: dict) -> dict:
             f"{emoji} [AlertAgent] Firing {signal} alert  "
             f"{ticker} @ ${price:.4f}  conf={confidence}/100..."
         )
-        sent = send_signal_alert(state)
+
+        # Parse entry zone string ("$1.75 - $1.85") into low/high floats
+        entry_zone = state.get("entry_zone", "")
+        try:
+            parts = entry_zone.replace("$", "").split("-")
+            entry_low  = float(parts[0].strip())
+            entry_high = float(parts[1].strip())
+        except Exception:
+            entry_low = entry_high = price
+
+        targets   = state.get("targets", [])
+        target    = targets[0] if targets else price
+        stop_loss = state.get("stop_loss", 0.0)
+        reasoning = state.get("reasoning", "")[:200]
+
+        sent = send_alert(
+            ticker=ticker,
+            signal=signal,
+            price=price,
+            entry_low=entry_low,
+            entry_high=entry_high,
+            target=target,
+            stop=stop_loss,
+            reason=reasoning,
+            confidence=int(confidence),
+        )
         if sent:
-            print("✅ [AlertAgent] Delivered via SMS + Push")
+            print("✅ [AlertAgent] Delivered via WhatsApp + Push")
         else:
             print("⚠️  [AlertAgent] Delivery failed (check Twilio/Pushover config)")
         return {**state, "alert_sent": sent}

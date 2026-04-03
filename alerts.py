@@ -1,79 +1,76 @@
 import requests
 from twilio.rest import Client
-from config import (
-    TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN,
-    TWILIO_FROM_NUMBER, TWILIO_TO_NUMBER,
-    PUSHOVER_APP_TOKEN, PUSHOVER_USER_KEY,
-)
+import os
+from dotenv import load_dotenv
 
+load_dotenv()
 
-def format_signal_message(state: dict) -> str:
-    signal = state.get("signal", "HOLD")
-    ticker = state.get("ticker", "")
-    price = state.get("current_price", 0)
-    entry = state.get("entry_zone", "N/A")
-    targets = state.get("targets", [])
-    stop_loss = state.get("stop_loss", 0)
-    rsi = state.get("rsi", 0)
-    macd = state.get("macd", {})
-    reasoning = state.get("reasoning", "")
+TWILIO_ACCOUNT_SID = os.getenv('TWILIO_ACCOUNT_SID')
+TWILIO_AUTH_TOKEN = os.getenv('TWILIO_AUTH_TOKEN')
+WHATSAPP_FROM = 'whatsapp:+14155238886'
+WHATSAPP_TO = f"whatsapp:{os.getenv('TWILIO_TO_NUMBER')}"
+PUSHOVER_APP_TOKEN = os.getenv('PUSHOVER_APP_TOKEN')
+PUSHOVER_USER_KEY = os.getenv('PUSHOVER_USER_KEY')
 
-    emoji = {"BUY": "🟢", "SELL": "🔴", "HOLD": "🟡"}.get(signal, "⚪")
-    targets_str = " / ".join(f"${t:.4f}" for t in targets) if targets else "N/A"
-
-    lines = [
-        f"{emoji} {signal} — {ticker}",
-        f"Price:      ${price:.4f}",
-        f"Entry Zone: {entry}",
-        f"Targets:    {targets_str}",
-        f"Stop Loss:  ${stop_loss:.4f}",
-        f"RSI:        {rsi:.1f}",
-        f"MACD Hist:  {macd.get('histogram', 0):+.6f}",
-    ]
-    if reasoning:
-        lines.append(f"\n{reasoning[:300]}")
-    return "\n".join(lines)
-
-
-def send_sms(message: str) -> bool:
+def send_whatsapp(message: str):
     try:
         client = Client(TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN)
-        client.messages.create(body=message, from_=TWILIO_FROM_NUMBER, to=TWILIO_TO_NUMBER)
-        print("[Alerts] SMS sent")
+        msg = client.messages.create(
+            body=message,
+            from_=WHATSAPP_FROM,
+            to=WHATSAPP_TO
+        )
+        print(f'✅ WhatsApp sent: {msg.sid}')
         return True
     except Exception as e:
-        print(f"[Alerts] SMS error: {e}")
+        print(f'❌ WhatsApp error: {e}')
         return False
 
-
-def send_push(title: str, message: str, priority: int = 0) -> bool:
+def send_push(title: str, message: str):
     try:
-        r = requests.post(
-            "https://api.pushover.net/1/messages.json",
-            data={
-                "token": PUSHOVER_APP_TOKEN,
-                "user": PUSHOVER_USER_KEY,
-                "title": title,
-                "message": message,
-                "priority": priority,
-            },
-            timeout=10,
-        )
-        ok = r.status_code == 200
-        if ok:
-            print("[Alerts] Push notification sent")
-        return ok
+        r = requests.post('https://api.pushover.net/1/messages.json', data={
+            'token': PUSHOVER_APP_TOKEN,
+            'user': PUSHOVER_USER_KEY,
+            'title': title,
+            'message': message,
+            'sound': 'cashregister'
+        })
+        print(f'✅ Push sent: {r.status_code}')
+        return True
     except Exception as e:
-        print(f"[Alerts] Push error: {e}")
+        print(f'❌ Push error: {e}')
         return False
 
+def send_alert(ticker: str, signal: str, price: float,
+               entry_low: float, entry_high: float,
+               target: float, stop: float,
+               reason: str, confidence: int):
 
-def send_signal_alert(state: dict) -> bool:
-    message = format_signal_message(state)
-    signal = state.get("signal", "HOLD")
-    ticker = state.get("ticker", "")
-    title = f"{signal} — {ticker}"
-    priority = 1 if signal in ("BUY", "SELL") else 0
-    sms_ok = send_sms(message)
-    push_ok = send_push(title, message, priority=priority)
-    return sms_ok or push_ok
+    emoji = 'BUY' if signal == 'BUY' else 'SELL' if signal == 'SELL' else 'HOLD'
+
+    message = (
+        f'Stock AI Agent - {emoji}\n'
+        f'Ticker: {ticker} at ${price:.2f}\n'
+        f'Zone: ${entry_low:.2f} - ${entry_high:.2f}\n'
+        f'Target: ${target:.2f} | Stop: ${stop:.2f}\n'
+        f'Reason: {reason}\n'
+        f'Confidence: {confidence}%'
+    )
+
+    send_whatsapp(message)
+
+    if PUSHOVER_APP_TOKEN and PUSHOVER_APP_TOKEN != 'your_key_here':
+        send_push(f'Stock AI Agent - {signal} {ticker}', message)
+
+if __name__ == '__main__':
+    send_alert(
+        ticker='BZAI',
+        signal='BUY',
+        price=1.79,
+        entry_low=1.75,
+        entry_high=1.82,
+        target=2.10,
+        stop=1.65,
+        reason='RSI oversold + volume spike 3.7x',
+        confidence=72
+    )

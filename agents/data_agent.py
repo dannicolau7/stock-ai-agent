@@ -37,13 +37,13 @@ def run_data_agent(state: dict) -> dict:
         print(f"   📦 Volume ratio: {volume_ratio}x average")
 
         state.update({
-            "price":         price,
+            "current_price": price,
             "bars":          bars,
-            "prev_close":    prev,
-            "news":          news,
+            "prev_close":    float(prev.get("c", price)),
+            "raw_news":      news,
             "ticker_details": details,
             "avg_volume":    round(avg_volume, 2),
-            "current_volume": current_volume,
+            "volume":        float(current_volume),
             "volume_ratio":  volume_ratio,
             "error":         None,
         })
@@ -54,6 +54,9 @@ def run_data_agent(state: dict) -> dict:
         state["error"] = str(e)
 
     return state
+
+
+data_node = run_data_agent  # alias for graph.py
 
 
 if __name__ == "__main__":

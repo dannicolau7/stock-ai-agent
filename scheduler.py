@@ -2,8 +2,7 @@
 scheduler.py — Full-day trading schedule.
 
   3:00 AM  Overnight news scan  (WhatsApp if score >= 85)
-  7:45 AM  Broad market sweep (~50 tickers, no Claude)
-  8:00 AM  Morning digest WhatsApp — "Top 5 opportunities"
+  7:45 AM  Best-of-Day selection (gate filter → score → Claude → WhatsApp)
   9:25 AM  "Market opens in 5 min" alert
   9:30 AM  Live monitoring (handled by main.py's monitoring_loop)
   4:00 PM  "Market closed" + after-hours summary
@@ -24,7 +23,7 @@ from zoneinfo import ZoneInfo
 import watchlist_manager as wl
 from alerts import send_whatsapp
 from graph import GRAPH, make_initial_state
-from market_scanner import scan_broad_market
+from market_scanner import scan_best_of_day, scan_broad_market
 
 EST      = ZoneInfo("America/New_York")
 _executor = ThreadPoolExecutor(max_workers=2)
@@ -110,35 +109,27 @@ async def _run_off_hours_scan(event_name: str, paper: bool,
 
 
 async def _run_morning_sweep(paper: bool):
+    """
+    7:45 AM — Best-of-Day selection pipeline.
+    Runs gate filtering → scoring → Claude ranking → WhatsApp (handled internally).
+    Takes ~10–15 min due to bulk download + Polygon news rate limits.
+    """
     global _sweep_results
-    print("\n⏰ [7:45 AM] Starting broad market sweep...")
+    print("\n⏰ [7:45 AM] Starting Best-of-Day selection pipeline...")
     watchlist = wl.load()
-    loop = asyncio.get_running_loop()
-    _sweep_results = await loop.run_in_executor(
-        _executor, scan_broad_market, watchlist, 5
+    loop      = asyncio.get_running_loop()
+    result    = await loop.run_in_executor(
+        _executor,
+        lambda: scan_best_of_day(
+            paper=paper,
+            verbose=False,
+            extra_tickers=watchlist,
+        ),
     )
-    print(f"✅ [7:45 AM] Sweep done. Top pick: {_sweep_results[0]['ticker'] if _sweep_results else '—'}")
-
-
-async def _send_morning_digest(paper: bool):
-    if not _sweep_results:
-        print("⚠️  [8:00 AM] No sweep results — skipping digest")
-        return
-
-    lines = ["☀️ Good morning! Top 5 opportunities today (7:45 AM sweep)\n"]
-    for i, r in enumerate(_sweep_results, 1):
-        sig = "BUY setup" if r["score"] >= 65 else "WATCH" if r["score"] >= 50 else "HOLD"
-        lines.append(
-            f"{i}. {r['ticker']} — score {r['score']} | ${r['price']:.2f} | {sig}\n"
-            f"   RSI {r['rsi']:.0f}, vol {r['vol_ratio']:.1f}x | {r['reason']}"
-        )
-    lines.append("\nMarket opens 9:30 AM EST. Good luck! 🚀")
-    msg = "\n".join(lines)
-
-    if not paper:
-        send_whatsapp(msg)
-    else:
-        print(f"📋 [PAPER] Morning digest:\n{msg}")
+    # Store winner as single-item list so _send_market_opens_soon can reference it
+    _sweep_results = [result] if result else []
+    top = result.get("ticker", "—") if result else "—"
+    print(f"✅ [7:45 AM] Best-of-Day complete. Winner: {top}")
 
 
 async def _send_market_opens_soon(paper: bool):
@@ -248,15 +239,10 @@ async def scheduler_loop(paper: bool, daily_log: list, signal_memory: dict):
                     daily_log=daily_log,
                 )
 
-            # ── 7:45 AM — Broad market sweep
+            # ── 7:45 AM — Best-of-Day selection (includes WhatsApp send)
             if weekday and _in_window(7, 45) and _should_fire("morning_sweep"):
                 _mark_fired("morning_sweep")
                 await _run_morning_sweep(paper)
-
-            # ── 8:00 AM — Morning digest
-            if weekday and _in_window(8, 0) and _should_fire("morning_digest"):
-                _mark_fired("morning_digest")
-                await _send_morning_digest(paper)
 
             # ── 9:25 AM — Market opens soon
             if weekday and _in_window(9, 25) and _should_fire("market_opens_soon"):

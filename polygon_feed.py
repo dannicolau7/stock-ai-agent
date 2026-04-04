@@ -1,3 +1,4 @@
+import time
 import requests
 import yfinance as yf
 from datetime import datetime, timedelta
@@ -6,13 +7,21 @@ from config import POLYGON_API_KEY
 BASE_URL = "https://api.polygon.io"
 
 
-def _get(path: str, params: dict = None) -> dict:
+def _get(path: str, params: dict = None, retries: int = 3) -> dict:
     p = {"apiKey": POLYGON_API_KEY}
     if params:
         p.update(params)
-    r = requests.get(f"{BASE_URL}{path}", params=p, timeout=15)
-    r.raise_for_status()
-    return r.json()
+    for attempt in range(retries):
+        r = requests.get(f"{BASE_URL}{path}", params=p, timeout=15)
+        if r.status_code == 429:
+            wait = 15 * (attempt + 1)
+            print(f"⏳ [Polygon] Rate limited — waiting {wait}s (attempt {attempt+1}/{retries})...")
+            time.sleep(wait)
+            continue
+        r.raise_for_status()
+        return r.json()
+    r.raise_for_status()  # raise after exhausting retries
+    return {}
 
 
 def get_daily_bars(ticker: str, days: int = 60) -> list:

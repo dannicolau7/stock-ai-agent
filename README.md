@@ -197,16 +197,19 @@ python3 quick_check.py BZAI AAPL NVDA
 
 ```bash
 # Paper trading — full pipeline, no real SMS/push sent
-python3 main.py --ticker BZAI --paper
+python3 main.py --ticker BZAI AWRE LTRX BBAI SOUN --paper
 
 # Live monitoring — fires real alerts
-python3 main.py --ticker BZAI
+python3 main.py --ticker BZAI AWRE LTRX BBAI SOUN
+
+# Monitor tickers from watchlist.json (no --ticker flag needed)
+python3 main.py --paper
 
 # Custom scan interval (every 2 minutes)
-python3 main.py --ticker BZAI --interval 120
+python3 main.py --ticker BZAI AWRE LTRX BBAI SOUN --interval 120
 
 # Custom dashboard port
-python3 main.py --ticker BZAI --port 8080
+python3 main.py --ticker BZAI AWRE LTRX BBAI SOUN --port 8080
 ```
 
 ### Watchlist management

@@ -111,7 +111,8 @@
     /* ── Watchlist panel ── */
     #watchlist-body { flex: 1; overflow-y: auto; }
     .watch-row { display: grid; grid-template-columns: 1fr auto auto auto; gap: 8px; padding: 9px 12px; border-bottom: 1px solid #21262d; align-items: center; }
-    .watch-row:hover { background: var(--surface); }
+    .watch-row:hover { background: var(--surface); cursor: pointer; }
+    .watch-row.active { background: #161b2299; border-left: 2px solid var(--blue); }
     .watch-ticker { font-weight: 700; font-size: 13px; color: var(--blue); }
     .watch-price  { font-weight: 600; font-size: 12px; }
     .watch-rsi    { font-size: 11px; color: var(--muted); }
@@ -296,10 +297,19 @@ function resizeCharts() {
 }
 window.addEventListener('resize', resizeCharts);
 
+// ── Active ticker ──────────────────────────────────────────────────────────────
+let activeTicker = null;
+
+function setActiveTicker(t) {
+  activeTicker = t;
+  Promise.all([fetchBars(), fetchState()]);
+}
+
 // ── Fetch bars ─────────────────────────────────────────────────────────────────
 async function fetchBars() {
   try {
-    const res  = await fetch('/api/bars');
+    const url  = activeTicker ? `/api/bars?ticker=${activeTicker}` : '/api/bars';
+    const res  = await fetch(url);
     const data = await res.json();
     const bars = (data.bars || []).filter(b => b.open && b.high && b.low && b.close);
     if (!bars.length) return;
@@ -336,7 +346,8 @@ async function fetchBars() {
 // ── Fetch state ────────────────────────────────────────────────────────────────
 async function fetchState() {
   try {
-    const res  = await fetch('/api/state');
+    const url  = activeTicker ? `/api/state?ticker=${activeTicker}` : '/api/state';
+    const res  = await fetch(url);
     const data = await res.json();
     updateSignalUI(data.state || {}, data.history || []);
     updateMarketStatus(data.market_open, data.paper_trading);
@@ -529,12 +540,13 @@ function renderNews(news) {
 function renderWatchlist(watchlist, memory) {
   const body = document.getElementById('watchlist-body');
   body.innerHTML = watchlist.map(w => {
-    const cls = 'watch-sig sig-' + (w.signal || 'hold').toLowerCase();
-    return `<div class="watch-row">
+    const cls    = 'watch-sig sig-' + (w.signal || 'hold').toLowerCase();
+    const active = (activeTicker || watchlist[0]?.ticker) === w.ticker ? ' active' : '';
+    return `<div class="watch-row${active}" onclick="setActiveTicker('${w.ticker}'); switchTab('signal');">
       <span class="watch-ticker">${w.ticker}</span>
-      <span class="watch-price">$${Number(w.price || 0).toFixed(4)}</span>
-      <span class="watch-rsi">RSI ${Number(w.rsi || 0).toFixed(1)}</span>
-      <span class="${cls} pill">${w.signal || 'HOLD'}</span>
+      <span class="watch-price">${w.price ? '$' + Number(w.price).toFixed(2) : '—'}</span>
+      <span class="watch-rsi">RSI ${w.rsi ? Number(w.rsi).toFixed(1) : '—'}</span>
+      <span class="${cls} pill">${w.signal || '—'}</span>
     </div>`;
   }).join('');
 
@@ -597,12 +609,20 @@ async function triggerRun() {
   btn.textContent = '⏳ Running...';
   btn.disabled = true;
   try {
-    await fetch('/api/run', { method: 'POST' });
+    const res      = await fetch('/api/run', { method: 'POST' });
+    const data     = await res.json();
+    const nTickers = (data.tickers || [1]).length;
+    const waitMs   = Math.max(30000, nTickers * 20000);  // 20s per ticker, min 30s
+    let remaining  = Math.round(waitMs / 1000);
+    const iv = setInterval(() => {
+      btn.textContent = `⏳ ${--remaining}s`;
+    }, 1000);
     setTimeout(async () => {
+      clearInterval(iv);
       await Promise.all([fetchBars(), fetchState(), fetchNews(), fetchWatchlist()]);
       btn.textContent = '▶ Run Now';
       btn.disabled = false;
-    }, 18000);
+    }, waitMs);
   } catch(e) {
     btn.textContent = '▶ Run Now';
     btn.disabled = false;

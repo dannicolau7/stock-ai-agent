@@ -37,7 +37,7 @@ import logger
 
 def _parse_args():
     p = argparse.ArgumentParser(description="Stock AI Agent")
-    p.add_argument("--ticker",   default=None,  help="Ticker symbol (overrides .env TICKER)")
+    p.add_argument("--ticker",   nargs="+", default=None,  help="One or more ticker symbols (e.g. --ticker BZAI AWRE)")
     p.add_argument("--interval", type=int, default=300, help="Scan interval seconds (default 300 = 5 min)")
     p.add_argument("--paper",    action="store_true",   help="Paper trading — no real SMS/push alerts")
     p.add_argument("--port",     type=int, default=8000, help="Dashboard port (default 8000)")
@@ -61,9 +61,19 @@ if _args.list:
     wl.list_tickers()
     raise SystemExit(0)
 
-# Resolve active ticker: CLI flag → .env → first watchlist entry
+# Resolve tickers: CLI flag → .env → watchlist → default
 _watchlist = wl.load()
-TICKER   = _args.ticker or config.TICKER or (_watchlist[0] if _watchlist else "BZAI")
+_cli_tickers = _args.ticker  # list or None
+if _cli_tickers:
+    TICKERS = [t.upper() for t in _cli_tickers]
+elif _watchlist:
+    TICKERS = _watchlist
+elif config.TICKER:
+    TICKERS = [t.strip().upper() for t in config.TICKER.split() if t.strip()]
+else:
+    TICKERS = ["BZAI"]
+
+TICKER   = TICKERS[0]   # primary ticker (for display / single-ticker APIs)
 INTERVAL = _args.interval
 PAPER    = _args.paper
 PORT     = _args.port
@@ -93,8 +103,14 @@ def is_report_window() -> bool:
 
 # ── Shared in-memory state ─────────────────────────────────────────────────────
 
+latest_states:    dict  = {}     # {ticker: state_dict}
+signal_histories: dict  = {}     # {ticker: [last 200]}
+latest_bars_map:  dict  = {}     # {ticker: bars_list}
+latest_news_map:  dict  = {}     # {ticker: news_list}
+
+# convenience aliases pointing at primary ticker (kept for backward compat)
 latest_state:     dict  = {}
-signal_history:   list  = []     # rolling last 200 runs
+signal_history:   list  = []
 latest_bars:      list  = []
 latest_news:      list  = []
 
@@ -117,24 +133,35 @@ def _run_sync(ticker: str, paper: bool) -> dict:
 def _store_result(result: dict):
     global latest_state, signal_history, latest_bars, latest_news
 
-    latest_bars  = result.get("bars", [])
-    latest_news  = result.get("raw_news", [])
+    ticker = result.get("ticker", TICKER)
 
-    latest_state = {
-        k: v for k, v in result.items()
-        if k not in ("bars", "snapshot", "raw_news")
-    }
-    latest_state["timestamp"] = datetime.now().isoformat()
+    bars  = result.get("bars", [])
+    news  = result.get("raw_news", [])
+    state = {k: v for k, v in result.items() if k not in ("bars", "snapshot", "raw_news")}
+    state["timestamp"] = datetime.now().isoformat()
 
-    signal_history.append({
-        "timestamp":  latest_state["timestamp"],
-        "price":      latest_state.get("current_price", 0),
-        "signal":     latest_state.get("signal", "HOLD"),
-        "confidence": latest_state.get("confidence", 0),
-        "rsi":        latest_state.get("rsi", 50),
+    latest_bars_map[ticker]  = bars
+    latest_news_map[ticker]  = news
+    latest_states[ticker]    = state
+
+    hist = signal_histories.setdefault(ticker, [])
+    hist.append({
+        "timestamp":  state["timestamp"],
+        "price":      state.get("current_price", 0),
+        "signal":     state.get("signal", "HOLD"),
+        "confidence": state.get("confidence", 0),
+        "rsi":        state.get("rsi", 50),
     })
-    if len(signal_history) > 200:
-        signal_history.pop(0)
+    if len(hist) > 200:
+        hist.pop(0)
+
+    # keep primary-ticker aliases up-to-date
+    if ticker == TICKER:
+        latest_state.clear()
+        latest_state.update(state)
+        latest_bars[:]  = bars
+        latest_news[:]  = news
+        signal_history[:]  = hist
 
 
 def _update_signal_memory(result: dict):
@@ -174,29 +201,30 @@ def _check_exits(ticker: str, price: float) -> str | None:
     return None
 
 
-async def run_once():
+async def run_once(ticker: str = None):
+    ticker = ticker or TICKER
     loop   = asyncio.get_running_loop()
-    result = await loop.run_in_executor(_executor, _run_sync, TICKER, PAPER)
+    result = await loop.run_in_executor(_executor, _run_sync, ticker, PAPER)
 
     _store_result(result)
     _update_signal_memory(result)
 
     # Stop loss / target monitoring
     price       = result.get("current_price", 0.0)
-    exit_reason = _check_exits(TICKER, price)
+    exit_reason = _check_exits(ticker, price)
     if exit_reason:
         icon = "🛑" if exit_reason == "STOP_LOSS" else "🎯"
-        print(f"{icon} [Monitor] {exit_reason} triggered for {TICKER} @ ${price:.4f}")
+        print(f"{icon} [Monitor] {exit_reason} triggered for {ticker} @ ${price:.4f}")
         if not PAPER:
             try:
-                from alerts import send_push, send_sms
+                from alerts import send_push, send_whatsapp
                 label = "🛑 STOP LOSS HIT" if exit_reason == "STOP_LOSS" else "🎯 TARGET HIT"
-                msg   = f"{label}\n{TICKER} @ ${price:.4f}"
-                send_push(f"{exit_reason} — {TICKER}", msg, priority=1)
-                send_sms(msg)
+                msg   = f"{label}\n{ticker} @ ${price:.4f}"
+                send_push(f"{exit_reason} — {ticker}", msg)
+                send_whatsapp(msg)
             except Exception as e:
                 print(f"❌ [Monitor] Exit alert failed: {e}")
-        signal_memory.pop(TICKER, None)
+        signal_memory.pop(ticker, None)
 
     sig  = result.get("signal", "HOLD")
     conf = result.get("confidence", 0)
@@ -244,7 +272,7 @@ async def _send_daily_report():
 async def monitoring_loop():
     global report_sent_date
     mode = "📋 PAPER" if PAPER else "🔴 LIVE"
-    print(f"🚀 Stock AI Agent starting  [{mode}]  ticker={TICKER}  interval={INTERVAL}s")
+    print(f"🚀 Stock AI Agent starting  [{mode}]  tickers={', '.join(TICKERS)}  interval={INTERVAL}s")
     print(f"📊 Dashboard → http://localhost:{PORT}")
 
     # Print watchlist on startup
@@ -256,19 +284,18 @@ async def monitoring_loop():
     while True:
         try:
             if is_market_open():
-                await run_once()
+                for i, t in enumerate(TICKERS):
+                    if i > 0:
+                        await asyncio.sleep(20)  # avoid Polygon 5 req/min rate limit
+                    await run_once(t)
             else:
                 now_est  = datetime.now(tz=EST)
                 now_date = now_est.strftime("%Y-%m-%d")
-                if is_report_window() and report_sent_date != now_date:
-                    await _send_daily_report()
-                    report_sent_date = now_date
-                else:
-                    print(
-                        f"🕐 [Monitor] Market closed "
-                        f"({now_est.strftime('%a %H:%M EST')}) — "
-                        f"next check in {INTERVAL}s"
-                    )
+                print(
+                    f"🕐 [Monitor] Market closed "
+                    f"({now_est.strftime('%a %H:%M EST')}) — "
+                    f"next check in {INTERVAL}s"
+                )
         except Exception as e:
             print(f"❌ [Monitor] Loop error: {e}")
 
@@ -279,9 +306,14 @@ async def monitoring_loop():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    task = asyncio.create_task(monitoring_loop())
+    from scheduler import scheduler_loop
+    task_monitor   = asyncio.create_task(monitoring_loop())
+    task_scheduler = asyncio.create_task(
+        scheduler_loop(paper=PAPER, daily_log=daily_log, signal_memory=signal_memory)
+    )
     yield
-    task.cancel()
+    task_monitor.cancel()
+    task_scheduler.cancel()
 
 
 app = FastAPI(title=f"Stock AI Agent — {TICKER}", lifespan=lifespan)
@@ -297,18 +329,24 @@ async def serve_dashboard():
 
 
 @app.get("/api/state")
-async def api_state():
+async def api_state(ticker: str = None):
+    t = (ticker or TICKER).upper()
+    state   = latest_states.get(t, latest_state if t == TICKER else {})
+    history = signal_histories.get(t, signal_history if t == TICKER else [])
     return JSONResponse({
-        "state":        latest_state,
-        "history":      signal_history,
+        "state":        state,
+        "history":      history,
         "paper_trading": PAPER,
-        "ticker":       TICKER,
+        "ticker":       t,
+        "tickers":      TICKERS,
         "market_open":  is_market_open(),
     })
 
 
 @app.get("/api/bars")
-async def api_bars():
+async def api_bars(ticker: str = None):
+    t    = (ticker or TICKER).upper()
+    bars = latest_bars_map.get(t, latest_bars if t == TICKER else [])
     tv_bars = [
         {
             "time":   b.get("t", 0) // 1000,
@@ -318,9 +356,9 @@ async def api_bars():
             "close":  b.get("c"),
             "volume": b.get("v"),
         }
-        for b in latest_bars
+        for b in bars
     ]
-    return JSONResponse({"bars": tv_bars, "ticker": TICKER})
+    return JSONResponse({"bars": tv_bars, "ticker": t})
 
 
 @app.get("/api/news")
@@ -339,22 +377,28 @@ async def api_news():
 
 @app.get("/api/watchlist")
 async def api_watchlist():
-    return JSONResponse({
-        "watchlist": [{
-            "ticker":     TICKER,
-            "signal":     latest_state.get("signal", "HOLD"),
-            "confidence": latest_state.get("confidence", 0),
-            "price":      latest_state.get("current_price", 0),
-            "rsi":        latest_state.get("rsi", 50),
-        }],
-        "memory": signal_memory,
-    })
+    rows = []
+    for t in TICKERS:
+        s = latest_states.get(t, latest_state if t == TICKER else {})
+        rows.append({
+            "ticker":     t,
+            "signal":     s.get("signal", "—"),
+            "confidence": s.get("confidence", 0),
+            "price":      s.get("current_price", 0),
+            "rsi":        s.get("rsi", 0),
+        })
+    return JSONResponse({"watchlist": rows, "memory": signal_memory})
 
 
 @app.post("/api/run")
 async def api_trigger_run():
-    asyncio.create_task(run_once())
-    return {"status": "triggered", "ticker": TICKER}
+    async def _run_all():
+        for i, t in enumerate(TICKERS):
+            if i > 0:
+                await asyncio.sleep(20)
+            await run_once(t)
+    asyncio.create_task(_run_all())
+    return {"status": "triggered", "tickers": TICKERS}
 
 
 @app.get("/api/log")

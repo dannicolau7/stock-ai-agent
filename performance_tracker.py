@@ -60,7 +60,9 @@ def init_db():
                 sentiment       TEXT,
                 reasoning       TEXT,
                 fired_at        TEXT    NOT NULL,
-                paper           INTEGER DEFAULT 0
+                paper           INTEGER DEFAULT 0,
+                sector          TEXT,
+                avg_volume      REAL    DEFAULT 0
             );
 
             CREATE TABLE IF NOT EXISTS outcomes (
@@ -77,6 +79,15 @@ def init_db():
             CREATE INDEX IF NOT EXISTS idx_signals_fired  ON signals(fired_at);
             CREATE INDEX IF NOT EXISTS idx_outcomes_sig   ON outcomes(signal_id);
         """)
+        # Migrate existing databases — ADD COLUMN is idempotent via try/except
+        for ddl in (
+            "ALTER TABLE signals ADD COLUMN sector TEXT",
+            "ALTER TABLE signals ADD COLUMN avg_volume REAL DEFAULT 0",
+        ):
+            try:
+                conn.execute(ddl)
+            except Exception:
+                pass   # column already exists
 
 
 # ── Record a new signal ───────────────────────────────────────────────────────
@@ -120,6 +131,8 @@ def record_signal(state: dict) -> int | None:
         "reasoning":      state.get("reasoning", "")[:300],
         "fired_at":       datetime.now().isoformat(),
         "paper":          int(state.get("paper_trading", False)),
+        "sector":         state.get("sector", ""),
+        "avg_volume":     state.get("avg_volume", 0.0),
     }
 
     with _get_conn() as conn:
@@ -127,11 +140,13 @@ def record_signal(state: dict) -> int | None:
             INSERT INTO signals
               (ticker, signal, price, confidence, stop_loss, target_1, target_2,
                trade_horizon, news_triggered, macro_regime, macro_bias, geo_bias,
-               market_health, rsi, volume_spike, sentiment, reasoning, fired_at, paper)
+               market_health, rsi, volume_spike, sentiment, reasoning, fired_at, paper,
+               sector, avg_volume)
             VALUES
               (:ticker, :signal, :price, :confidence, :stop_loss, :target_1, :target_2,
                :trade_horizon, :news_triggered, :macro_regime, :macro_bias, :geo_bias,
-               :market_health, :rsi, :volume_spike, :sentiment, :reasoning, :fired_at, :paper)
+               :market_health, :rsi, :volume_spike, :sentiment, :reasoning, :fired_at, :paper,
+               :sector, :avg_volume)
         """, row)
         sig_id = cur.lastrowid
 

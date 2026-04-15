@@ -49,8 +49,12 @@ def alert_node(state: dict) -> dict:
         return {**state, "alert_sent": False}
 
     if not should_alert:
-        emoji = "🟢" if signal == "BUY" else "🔴" if signal == "SELL" else "🟡"
-        print(f"{emoji} [AlertAgent] {signal} conf={confidence}/100 — no alert needed")
+        if signal == "WATCH":
+            exec_reason = state.get("execution_reason", "execution gate blocked")
+            print(f"👁️  [AlertAgent] {ticker} WATCH — {exec_reason}")
+        else:
+            emoji = "🟢" if signal == "BUY" else "🔴" if signal == "SELL" else "🟡"
+            print(f"{emoji} [AlertAgent] {signal} conf={confidence}/100 — no alert needed")
         return {**state, "alert_sent": False}
 
     if paper_trading:

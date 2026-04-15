@@ -28,13 +28,15 @@ class AgentState(TypedDict):
     paper_trading: bool
 
     # Data node
-    current_price: float
-    prev_close:    float
-    volume:        float
-    avg_volume:    float
-    bars:          list
-    snapshot:      dict
-    raw_news:      list
+    current_price:  float
+    prev_close:     float
+    volume:         float
+    avg_volume:     float
+    volume_ratio:   float
+    bars:           list
+    raw_news:       list
+    ticker_details: dict
+    error:          str
 
     # News node
     news_sentiment:  str
@@ -160,8 +162,10 @@ def make_initial_state(ticker: str, paper_trading: bool = False) -> AgentState:
         volume=0.0,
         avg_volume=0.0,
         bars=[],
-        snapshot={},
         raw_news=[],
+        ticker_details={},
+        volume_ratio=0.0,
+        error="",
         news_sentiment="NEUTRAL",
         sentiment_score=50.0,
         news_summary="",

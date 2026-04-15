@@ -41,7 +41,7 @@ def risk_node(state: dict) -> dict:
     # Only BUY signals go through risk checks
     if signal != "BUY":
         return {**state, "risk_approved": True, "risk_veto_reason": "",
-                "risk_multiplier": 1.0, "risk_score": 100}
+                "risk_multiplier": 1.0, "risk_warnings": []}
 
     confidence  = state.get("confidence", 0)
     atr         = state.get("atr", 0.0)
@@ -198,36 +198,67 @@ def _count_open_positions() -> int:
 
 
 def _sector_exposure_pct(sector: str) -> float:
-    """Fraction of open positions already in `sector`."""
+    """Fraction of open BUY positions already in `sector` (by position count)."""
     try:
         import performance_tracker as pt
-        import sqlite3
         with pt._get_conn() as conn:
-            total = conn.execute(
-                "SELECT COUNT(*) FROM positions WHERE exit_price IS NULL"
-            ).fetchone()[0]
+            # "Open" = BUY signal whose 7d outcome is still pending
+            total = conn.execute("""
+                SELECT COUNT(*) FROM signals s
+                WHERE s.signal = 'BUY' AND s.paper = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outcomes o
+                      WHERE o.signal_id = s.id
+                        AND o.checkpoint = '7d'
+                        AND o.win IS NOT NULL
+                  )
+            """).fetchone()[0]
             if total == 0:
                 return 0.0
             in_sector = conn.execute("""
-                SELECT COUNT(*) FROM positions p
-                JOIN signals s ON s.id = p.signal_id
-                WHERE p.exit_price IS NULL
-            """).fetchone()[0]
-            # NOTE: signals table doesn't store sector; use open count as proxy
-            # A full implementation would store sector in signals at record time
-            return 0.0   # conservative: no veto until sector stored in DB
+                SELECT COUNT(*) FROM signals s
+                WHERE s.signal = 'BUY' AND s.paper = 0
+                  AND s.sector = ?
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outcomes o
+                      WHERE o.signal_id = s.id
+                        AND o.checkpoint = '7d'
+                        AND o.win IS NOT NULL
+                  )
+            """, (sector,)).fetchone()[0]
+            return in_sector / total
     except Exception:
-        return 0.0
+        return 0.0   # fail open
 
 
 def _smallcap_exposure_pct() -> float:
-    """Fraction of positions that are small/micro cap (proxy: low avg volume)."""
+    """Fraction of open BUY positions in low-liquidity names (avg_volume < 500k)."""
     try:
         import performance_tracker as pt
-        open_count = len(pt.get_open_signals(paper=False))
-        if open_count == 0:
-            return 0.0
-        # Without per-position volume stored, use conservative proxy
-        return 0.0
+        with pt._get_conn() as conn:
+            total = conn.execute("""
+                SELECT COUNT(*) FROM signals s
+                WHERE s.signal = 'BUY' AND s.paper = 0
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outcomes o
+                      WHERE o.signal_id = s.id
+                        AND o.checkpoint = '7d'
+                        AND o.win IS NOT NULL
+                  )
+            """).fetchone()[0]
+            if total == 0:
+                return 0.0
+            small_cap = conn.execute("""
+                SELECT COUNT(*) FROM signals s
+                WHERE s.signal = 'BUY' AND s.paper = 0
+                  AND s.avg_volume > 0 AND s.avg_volume < 500000
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outcomes o
+                      WHERE o.signal_id = s.id
+                        AND o.checkpoint = '7d'
+                        AND o.win IS NOT NULL
+                  )
+            """).fetchone()[0]
+            return small_cap / total
     except Exception:
-        return 0.0
+        return 0.0   # fail open

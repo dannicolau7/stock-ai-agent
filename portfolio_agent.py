@@ -277,16 +277,48 @@ def get_portfolio_summary(paper: bool = False) -> dict:
 # ── Concentration warnings ────────────────────────────────────────────────────
 
 def _check_concentration(positions: list[dict]) -> list[str]:
-    """Warn if more than 40% of open positions are in the same sector."""
+    """
+    Warn if more than 40% of open positions are in the same sector.
+    Queries the signals DB for sector tags stored at alert time.
+    Falls back to duplicate-ticker check if sector data is unavailable.
+    """
     if len(positions) < 3:
         return []
     warnings = []
-    # Simple: flag if same ticker appears twice (crude duplicate check)
-    tickers = [p["ticker"] for p in positions]
-    from collections import Counter
-    for ticker, count in Counter(tickers).items():
-        if count > 1:
-            warnings.append(f"⚠️  {ticker} appears {count}× in open positions")
+    try:
+        import performance_tracker as pt
+        with pt._get_conn() as conn:
+            rows = conn.execute("""
+                SELECT s.sector, COUNT(*) AS cnt
+                FROM signals s
+                WHERE s.signal = 'BUY' AND s.paper = 0
+                  AND s.sector IS NOT NULL AND s.sector != ''
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outcomes o
+                      WHERE o.signal_id = s.id
+                        AND o.checkpoint = '7d'
+                        AND o.win IS NOT NULL
+                  )
+                GROUP BY s.sector
+            """).fetchall()
+        total = sum(r[1] for r in rows)
+        if total > 0:
+            for sector, count in rows:
+                pct = count / total
+                if pct >= 0.40:
+                    warnings.append(
+                        f"⚠️  Sector concentration: {sector} is {pct*100:.0f}% "
+                        f"of open positions (limit 40%)"
+                    )
+        else:
+            raise ValueError("no sector data — fallback")
+    except Exception:
+        # Fallback: flag duplicate tickers (original crude check)
+        from collections import Counter
+        tickers = [p["ticker"] for p in positions]
+        for ticker, count in Counter(tickers).items():
+            if count > 1:
+                warnings.append(f"⚠️  {ticker} appears {count}× in open positions")
     return warnings
 
 

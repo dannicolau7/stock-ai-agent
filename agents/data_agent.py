@@ -144,12 +144,21 @@ def run_data_agent(state: dict) -> dict:
             print(f"   📅 No near-term earnings risk")
 
         # Volume analysis
-        avg_volume = 0
+        avg_volume = 0.0
         if bars:
             volumes    = [b.get("v", 0) for b in bars[-30:]]
-            avg_volume = sum(volumes) / len(volumes) if volumes else 0
-        current_volume = prev.get("v", 0)
-        volume_ratio   = round(current_volume / avg_volume, 2) if avg_volume else 0
+            avg_volume = sum(volumes) / len(volumes) if volumes else 0.0
+
+        # Current session volume — sum today's intraday bars, NOT yesterday's aggregate.
+        # prev.get("v") is Polygon's /prev endpoint (previous-day close bar), so using it
+        # as "current volume" was always wrong. Falls back to 0 rather than propagating
+        # stale data into volume_spike / liquidity / sizing checks.
+        if intraday_bars:
+            current_volume = float(sum(b.get("v", 0) for b in intraday_bars))
+        else:
+            current_volume = 0.0   # pre-market or closed — no session data yet
+
+        volume_ratio = round(current_volume / avg_volume, 2) if avg_volume else 0
         print(f"   📦 Volume ratio: {volume_ratio}x average  |  Sector: {sector}")
 
         state.update({

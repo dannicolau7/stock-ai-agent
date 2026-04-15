@@ -15,7 +15,7 @@ decisions and improves over time.
 
 import asyncio
 import json
-from datetime import datetime, time as dtime
+from datetime import datetime, time as dtime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -228,7 +228,9 @@ async def reflection_agent_loop(paper: bool = False):
             now_et = datetime.now(ET)
             target = now_et.replace(hour=16, minute=15, second=0, microsecond=0)
             if now_et >= target:
-                target = target.replace(day=target.day + 1)
+                target = (target + timedelta(days=1)).replace(
+                    hour=16, minute=15, second=0, microsecond=0
+                )
 
             wait_s = (target - now_et).total_seconds()
             print(f"🧠 [Reflection] Next review in {wait_s/3600:.1f}h (at 4:15 PM ET)")

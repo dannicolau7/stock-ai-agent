@@ -18,6 +18,18 @@ from datetime import datetime, timezone
 import anthropic
 from config import ANTHROPIC_API_KEY
 
+# ── Per-source TTL caches ──────────────────────────────────────────────────────
+# Avoids re-hitting the same external API on every scan cycle for the same ticker.
+# Key: ticker str  →  Value: (fetched_at float, result)
+
+_ST_CACHE:     dict = {}   # StockTwits — 5 min TTL
+_REDDIT_CACHE: dict = {}   # Reddit     — 15 min TTL
+_RSS_CACHE:    dict = {}   # RSS feeds  — 10 min TTL
+
+_ST_TTL     = 5  * 60
+_REDDIT_TTL = 15 * 60
+_RSS_TTL    = 10 * 60
+
 
 # ── StockTwits ─────────────────────────────────────────────────────────────────
 
@@ -63,6 +75,9 @@ def _social_velocity(messages: list) -> dict:
 
 
 def _fetch_stocktwits(ticker: str) -> tuple:
+    cached = _ST_CACHE.get(ticker)
+    if cached and (time.time() - cached[0]) < _ST_TTL:
+        return cached[1]
     """
     Pull the latest 30 messages from StockTwits for ticker.
     Returns (sentiment, score_0_100, bull_count, bear_count, post_count).
@@ -92,7 +107,9 @@ def _fetch_stocktwits(ticker: str) -> tuple:
             return "NEUTRAL", 50, 0, 0, len(messages), velocity
         score     = round((bull / total) * 100)
         sentiment = "BULLISH" if score >= 60 else "BEARISH" if score <= 40 else "NEUTRAL"
-        return sentiment, score, bull, bear, len(messages), velocity
+        result = sentiment, score, bull, bear, len(messages), velocity
+        _ST_CACHE[ticker] = (time.time(), result)
+        return result
     except Exception as e:
         print(f"⚠️  [NewsAgent] StockTwits error: {e}")
         return "NEUTRAL", 50, 0, 0, 0, {"velocity": 1.0, "label": "no data"}
@@ -108,6 +125,9 @@ REDDIT_HEADERS = {"User-Agent": "argus/1.0 (research tool)"}
 
 def _fetch_reddit_headlines(ticker: str) -> list:
     """Return up to 8 post titles mentioning ticker from Reddit."""
+    cached = _REDDIT_CACHE.get(ticker)
+    if cached and (time.time() - cached[0]) < _REDDIT_TTL:
+        return cached[1]
     titles = []
     for sub in SUBREDDITS:
         try:
@@ -126,7 +146,9 @@ def _fetch_reddit_headlines(ticker: str) -> list:
             pass
         if len(titles) >= 8:
             break
-    return titles[:8]
+    result = titles[:8]
+    _REDDIT_CACHE[ticker] = (time.time(), result)
+    return result
 
 
 # ── CNN Markets RSS ────────────────────────────────────────────────────────────
@@ -143,6 +165,9 @@ def _fetch_market_headlines(ticker: str) -> list:
     Parse financial RSS feeds (Yahoo Finance, MarketWatch) for ticker headlines.
     Returns list of headline strings (up to 5).
     """
+    cached = _RSS_CACHE.get(ticker)
+    if cached and (time.time() - cached[0]) < _RSS_TTL:
+        return cached[1]
     ticker_upper = ticker.upper()
     headlines    = []
     feeds        = [
@@ -168,7 +193,9 @@ def _fetch_market_headlines(ticker: str) -> list:
                 break
         except Exception as e:
             print(f"⚠️  [NewsAgent] RSS error ({feed_url.split('/')[2]}): {e}")
-    return headlines[:5]
+    result = headlines[:5]
+    _RSS_CACHE[ticker] = (time.time(), result)
+    return result
 
 
 # ── Claude Haiku sentiment ─────────────────────────────────────────────────────

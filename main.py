@@ -303,7 +303,11 @@ async def monitoring_loop():
     while True:
         try:
             if is_market_open():
-                await asyncio.gather(*[_run_gated(t) for t in TICKERS])
+                # Merge static watchlist with discovery candidates (deduped)
+                from discovery_agent import get_discovery_tickers
+                discovery = get_discovery_tickers()
+                scan_list = list(dict.fromkeys(TICKERS + discovery[:10]))
+                await asyncio.gather(*[_run_gated(t) for t in scan_list])
             else:
                 now_est = datetime.now(tz=EST)
                 print(
@@ -325,26 +329,37 @@ async def lifespan(app: FastAPI):
     from news_watcher import news_watcher_loop, yf_news_watcher_loop
     from spike_watcher import spike_watcher_loop
     from edgar_watcher import edgar_watcher_loop
-    from geo_watcher      import geo_watcher_loop
-    from macro_watcher    import macro_watcher_loop
-    from earnings_watcher import earnings_watcher_loop
-    from breadth_watcher  import breadth_watcher_loop
-    from social_watcher   import social_watcher_loop
+    from geo_watcher        import geo_watcher_loop
+    from macro_watcher      import macro_watcher_loop
+    from earnings_watcher   import earnings_watcher_loop
+    from breadth_watcher    import breadth_watcher_loop
+    from social_watcher     import social_watcher_loop
+    from discovery_agent    import discovery_agent_loop
+    from portfolio_agent    import portfolio_agent_loop, init_positions_table
+    from reflection_agent   import reflection_agent_loop
+    from performance_tracker import init_db, performance_tracker_loop
 
-    task_monitor   = asyncio.create_task(monitoring_loop())
-    task_scheduler = asyncio.create_task(
+    init_db()
+    init_positions_table()
+
+    task_monitor    = asyncio.create_task(monitoring_loop())
+    task_scheduler  = asyncio.create_task(
         scheduler_loop(paper=PAPER, daily_log=_app_state.daily_log,
                         signal_memory=_app_state.signal_memory)
     )
-    task_watcher   = asyncio.create_task(news_watcher_loop(paper=PAPER))
-    task_yf_news   = asyncio.create_task(yf_news_watcher_loop(paper=PAPER))
-    task_spike     = asyncio.create_task(spike_watcher_loop(run_once, PAPER, wl.load))
-    task_edgar     = asyncio.create_task(edgar_watcher_loop(paper=PAPER))
-    task_geo       = asyncio.create_task(geo_watcher_loop())
-    task_macro     = asyncio.create_task(macro_watcher_loop())
-    task_earnings  = asyncio.create_task(earnings_watcher_loop(extra_tickers=TICKERS))
-    task_breadth   = asyncio.create_task(breadth_watcher_loop())
-    task_social    = asyncio.create_task(social_watcher_loop(extra_tickers=TICKERS))
+    task_watcher    = asyncio.create_task(news_watcher_loop(paper=PAPER))
+    task_yf_news    = asyncio.create_task(yf_news_watcher_loop(paper=PAPER))
+    task_spike      = asyncio.create_task(spike_watcher_loop(run_once, PAPER, wl.load))
+    task_edgar      = asyncio.create_task(edgar_watcher_loop(paper=PAPER))
+    task_geo        = asyncio.create_task(geo_watcher_loop())
+    task_macro      = asyncio.create_task(macro_watcher_loop())
+    task_earnings   = asyncio.create_task(earnings_watcher_loop(extra_tickers=TICKERS))
+    task_breadth    = asyncio.create_task(breadth_watcher_loop())
+    task_social     = asyncio.create_task(social_watcher_loop(extra_tickers=TICKERS))
+    task_discovery  = asyncio.create_task(discovery_agent_loop(static_watchlist_fn=wl.load))
+    task_portfolio  = asyncio.create_task(portfolio_agent_loop(paper=PAPER))
+    task_tracker    = asyncio.create_task(performance_tracker_loop())
+    task_reflection = asyncio.create_task(reflection_agent_loop(paper=PAPER))
     yield
     task_monitor.cancel()
     task_scheduler.cancel()
@@ -357,6 +372,10 @@ async def lifespan(app: FastAPI):
     task_earnings.cancel()
     task_breadth.cancel()
     task_social.cancel()
+    task_discovery.cancel()
+    task_portfolio.cancel()
+    task_tracker.cancel()
+    task_reflection.cancel()
 
 
 app = FastAPI(title=f"Stock AI Agent — {TICKER}", lifespan=lifespan)
@@ -554,6 +573,27 @@ async def api_performance():
         "spy_chg":               cb_status["spy_chg"],
         "circuit_breaker_active": not cb_status["safe"],
         "circuit_breaker_reason": cb_status["reason"],
+    }))
+
+
+@app.get("/api/portfolio")
+async def api_portfolio():
+    """Open positions, exit alerts, 30d win rate, and discovery candidates."""
+    from portfolio_agent  import get_portfolio_summary, get_cached_portfolio
+    from discovery_agent  import get_discovery_tickers
+    from reflection_agent import load_learnings
+    summary    = get_portfolio_summary(paper=PAPER)
+    learnings  = load_learnings()
+    return JSONResponse(_json_safe({
+        **summary,
+        "discovery_candidates": get_discovery_tickers()[:10],
+        "learnings": {
+            "win_rate_30d":      learnings.get("last_30d_win_rate"),
+            "confidence_adj":    learnings.get("confidence_adj", 0),
+            "latest_insight":    learnings.get("insights", [""])[-1],
+            "favor_conditions":  learnings.get("favor_conditions", []),
+            "avoid_conditions":  learnings.get("avoid_conditions", []),
+        },
     }))
 
 

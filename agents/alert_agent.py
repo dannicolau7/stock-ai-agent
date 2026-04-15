@@ -5,6 +5,7 @@ Only fires when should_alert is True.
 """
 
 from alerts import send_alert
+import performance_tracker as pt
 
 
 def alert_node(state: dict) -> dict:
@@ -69,6 +70,7 @@ def alert_node(state: dict) -> dict:
         )
         if sent:
             print("✅ [AlertAgent] Delivered via WhatsApp + Push")
+            pt.record_signal(state)   # log to performance tracker
         else:
             print("⚠️  [AlertAgent] Delivery failed (check Twilio/Pushover config)")
         return {**state, "alert_sent": sent}

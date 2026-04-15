@@ -10,6 +10,17 @@ CONFIDENCE_THRESHOLD      = 65
 NEWS_CONFIDENCE_THRESHOLD = 55   # lower gate when a news/spike/EDGAR event is the trigger
 
 
+def _get_threshold(news_triggered: bool) -> int:
+    """Returns confidence threshold, adjusted by reflection agent learnings."""
+    base = NEWS_CONFIDENCE_THRESHOLD if news_triggered else CONFIDENCE_THRESHOLD
+    try:
+        import world_context as wctx
+        adj = wctx.get()["macro"].get("confidence_adj", 0)
+        return max(45, min(80, base + int(adj)))
+    except Exception:
+        return base
+
+
 @traceable(name="decision_agent", tags=["claude", "signal"])
 def decision_node(state: dict) -> dict:
     ticker = state["ticker"]
@@ -22,11 +33,7 @@ def decision_node(state: dict) -> dict:
         signal     = result["signal"]
         confidence = result["confidence"]
 
-        threshold = (
-            NEWS_CONFIDENCE_THRESHOLD
-            if state.get("news_triggered")
-            else CONFIDENCE_THRESHOLD
-        )
+        threshold = _get_threshold(state.get("news_triggered", False))
 
         if confidence < threshold:
             print(

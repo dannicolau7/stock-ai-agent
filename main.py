@@ -284,7 +284,7 @@ async def _send_daily_report():
 
 async def monitoring_loop():
     mode = "📋 PAPER" if PAPER else "🔴 LIVE"
-    print(f"🚀 Argus starting  [{mode}]  tickers={', '.join(TICKERS)}  interval={INTERVAL}s")
+    print(f"🚀 Argus — Agentic Market Intelligence  [{mode}]  tickers={', '.join(TICKERS)}  interval={INTERVAL}s")
     print(f"📊 Dashboard → http://localhost:{PORT}")
 
     # Print watchlist on startup
@@ -378,7 +378,12 @@ async def lifespan(app: FastAPI):
     task_reflection.cancel()
 
 
-app = FastAPI(title=f"Argus — {TICKER}", lifespan=lifespan)
+app = FastAPI(
+    title="Argus — Agentic Market Intelligence",
+    description="Autonomous trading agent: perceives, reasons, acts, and learns.",
+    version="4.0",
+    lifespan=lifespan,
+)
 
 
 def _json_safe(value):

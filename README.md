@@ -1,6 +1,10 @@
-# Argus
+# Argus — Agentic Market Intelligence
 
-> Autonomous multi-agent stock intelligence system. 15 specialized agents run 24/7 — watching geopolitics, macro regimes, earnings calendars, market breadth, social flow, SEC filings, and price action — then synthesize everything into real-time BUY / SELL / HOLD signals. Self-improving: learns from every trade outcome and adjusts its own confidence thresholds daily.
+> **An autonomous trading agent that perceives, reasons, acts, and learns.**
+>
+> 15 specialized agents run in parallel 24/7 — perceiving geopolitics, macro regimes, earnings catalysts, market breadth, social flow, SEC filings, and price spikes. A shared world model synthesizes all signals into real-time BUY / SELL / HOLD decisions via Claude AI. A feedback loop tracks every outcome, reflects daily on what worked, and adjusts its own behavior — no human intervention required.
+>
+> *Perceive → Reason → Act → Observe → Learn → Repeat better.*
 
 **Version:** v4.0 &nbsp;|&nbsp; **Status:** Active Development
 

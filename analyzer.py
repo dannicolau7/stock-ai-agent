@@ -14,6 +14,7 @@ import anthropic
 from langsmith import traceable
 from config import ANTHROPIC_API_KEY
 from self_learner import get_weight_adjustments, get_summary as sl_summary
+import world_context as wctx
 
 _client = None
 
@@ -238,6 +239,8 @@ Apply timing multiplier ×{t_mult} to final score.
 
 === DETECTED CHART PATTERNS ===
 {patterns_str}
+
+{wctx.build_prompt_section()}
 
 === PRE-COMPUTED SCORE (validate and adjust if needed) ===
 {score_line}

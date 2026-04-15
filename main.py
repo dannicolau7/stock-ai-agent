@@ -325,6 +325,11 @@ async def lifespan(app: FastAPI):
     from news_watcher import news_watcher_loop, yf_news_watcher_loop
     from spike_watcher import spike_watcher_loop
     from edgar_watcher import edgar_watcher_loop
+    from geo_watcher      import geo_watcher_loop
+    from macro_watcher    import macro_watcher_loop
+    from earnings_watcher import earnings_watcher_loop
+    from breadth_watcher  import breadth_watcher_loop
+    from social_watcher   import social_watcher_loop
 
     task_monitor   = asyncio.create_task(monitoring_loop())
     task_scheduler = asyncio.create_task(
@@ -335,6 +340,11 @@ async def lifespan(app: FastAPI):
     task_yf_news   = asyncio.create_task(yf_news_watcher_loop(paper=PAPER))
     task_spike     = asyncio.create_task(spike_watcher_loop(run_once, PAPER, wl.load))
     task_edgar     = asyncio.create_task(edgar_watcher_loop(paper=PAPER))
+    task_geo       = asyncio.create_task(geo_watcher_loop())
+    task_macro     = asyncio.create_task(macro_watcher_loop())
+    task_earnings  = asyncio.create_task(earnings_watcher_loop(extra_tickers=TICKERS))
+    task_breadth   = asyncio.create_task(breadth_watcher_loop())
+    task_social    = asyncio.create_task(social_watcher_loop(extra_tickers=TICKERS))
     yield
     task_monitor.cancel()
     task_scheduler.cancel()
@@ -342,6 +352,11 @@ async def lifespan(app: FastAPI):
     task_yf_news.cancel()
     task_spike.cancel()
     task_edgar.cancel()
+    task_geo.cancel()
+    task_macro.cancel()
+    task_earnings.cancel()
+    task_breadth.cancel()
+    task_social.cancel()
 
 
 app = FastAPI(title=f"Stock AI Agent — {TICKER}", lifespan=lifespan)

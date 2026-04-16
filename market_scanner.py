@@ -44,7 +44,7 @@ from setups import detect_and_score
 # ── Constants ──────────────────────────────────────────────────────────────────
 
 CACHE_FILE     = "ticker_universe.json"
-CACHE_HOURS    = 24
+CACHE_HOURS    = 6    # refresh every 6h so hot new listings appear sooner
 BEST_PICKS_LOG = "best_picks_log.csv"
 SIGNALS_LOG    = "signals_log.csv"
 BASE_URL       = "https://api.polygon.io"
@@ -79,35 +79,90 @@ FALLBACK_UNIVERSE = [
 # ── Ticker universe ────────────────────────────────────────────────────────────
 
 def _fetch_polygon_tickers(max_tickers: int = 6000) -> list:
-    """Fetch active US stock tickers from Polygon. Paginates automatically."""
+    """
+    Fetch active US stock tickers from Polygon (NYSE + NASDAQ only).
+    Polygon does not support comma-separated exchange values, so we fetch
+    each exchange separately and merge, deduplicating by insertion order.
+    On 429 rate-limit, waits 65s and retries once before giving up.
+    """
+    seen    = set()
     tickers = []
-    url     = f"{BASE_URL}/v3/reference/tickers"
-    params  = {
-        "apiKey": POLYGON_API_KEY,
-        "active": "true",
-        "market": "stocks",
-        "locale": "us",
-        "limit":  1000,
-        "order":  "asc",
-        "sort":   "ticker",
-    }
-    print("📋 [Scanner] Fetching ticker universe from Polygon...")
-    while len(tickers) < max_tickers:
-        try:
-            r    = requests.get(url, params=params, timeout=20)
-            data = r.json()
-        except Exception as e:
-            print(f"⚠️  [Scanner] Polygon ticker fetch error: {e}")
-            break
-        results = data.get("results", [])
-        tickers.extend(t["ticker"] for t in results if "ticker" in t)
-        cursor = data.get("next_cursor")
-        if not cursor or not results:
-            break
-        params = {"apiKey": POLYGON_API_KEY, "cursor": cursor}
-        time.sleep(13)   # 5 req/min on free tier
-    print(f"✅ [Scanner] Got {len(tickers)} tickers from Polygon")
+
+    for exchange in ("XNYS", "XNAS"):
+        url    = f"{BASE_URL}/v3/reference/tickers"
+        params = {
+            "apiKey":   POLYGON_API_KEY,
+            "active":   "true",
+            "market":   "stocks",
+            "locale":   "us",
+            "limit":    1000,
+            "order":    "asc",
+            "sort":     "ticker",
+            "exchange": exchange,
+        }
+        print(f"📋 [Scanner] Fetching {exchange} tickers from Polygon...")
+        retried = False
+        while len(tickers) < max_tickers:
+            try:
+                r    = requests.get(url, params=params, timeout=20)
+                if r.status_code == 429:
+                    if not retried:
+                        print(f"⚠️  [Scanner] Polygon rate-limit on {exchange} — waiting 65s...")
+                        time.sleep(65)
+                        retried = True
+                        continue
+                    else:
+                        print(f"⚠️  [Scanner] Polygon rate-limit persists for {exchange} — skipping")
+                        break
+                retried = False
+                data = r.json()
+            except Exception as e:
+                print(f"⚠️  [Scanner] Polygon ticker fetch error ({exchange}): {e}")
+                break
+            results = data.get("results", [])
+            for t in results:
+                sym = t.get("ticker", "")
+                if sym and sym not in seen:
+                    seen.add(sym)
+                    tickers.append(sym)
+            cursor = data.get("next_cursor")
+            if not cursor or not results:
+                break
+            params = {"apiKey": POLYGON_API_KEY, "cursor": cursor}
+            time.sleep(13)   # 5 req/min on free tier
+
+    print(f"✅ [Scanner] Got {len(tickers)} tickers from Polygon (NYSE+NASDAQ)")
     return tickers[:max_tickers]
+
+
+def _fetch_sec_tickers(max_tickers: int = 6000) -> list:
+    """
+    Fallback universe: download all public company tickers from SEC EDGAR.
+    No API key required. Returns ~8,000 tickers covering NYSE + NASDAQ + OTC.
+    Filters to symbols that look like real stock tickers (1-5 alpha chars).
+    """
+    try:
+        print("📋 [Scanner] Fetching fallback universe from SEC EDGAR...")
+        r = requests.get(
+            "https://www.sec.gov/files/company_tickers.json",
+            headers={"User-Agent": "argus contact@example.com"},
+            timeout=15,
+        )
+        data = r.json()
+        tickers = [
+            v["ticker"].upper()
+            for v in data.values()
+            if (v.get("ticker")
+                and v["ticker"].isalpha()          # no warrants (W suffix), units (U), rights (R)
+                and 1 <= len(v["ticker"]) <= 5
+                and not v["ticker"].endswith(("W", "R", "U", "P", "Q"))  # warrants/rights/units/preferred/bankruptcy
+            )
+        ]
+        print(f"✅ [Scanner] SEC fallback: {len(tickers)} tickers")
+        return tickers[:max_tickers]
+    except Exception as e:
+        print(f"⚠️  [Scanner] SEC fallback failed: {e}")
+        return []
 
 
 def _load_universe(max_tickers: int = 6000) -> list:
@@ -124,6 +179,8 @@ def _load_universe(max_tickers: int = 6000) -> list:
         except Exception:
             pass
     tickers = _fetch_polygon_tickers(max_tickers)
+    if not tickers:
+        tickers = _fetch_sec_tickers(max_tickers)
     if tickers:
         try:
             with open(CACHE_FILE, "w") as f:
@@ -131,7 +188,7 @@ def _load_universe(max_tickers: int = 6000) -> list:
         except Exception:
             pass
         return tickers
-    print(f"⚠️  [Scanner] Using fallback universe ({len(FALLBACK_UNIVERSE)} tickers)")
+    print(f"⚠️  [Scanner] Using hardcoded fallback universe ({len(FALLBACK_UNIVERSE)} tickers)")
     return FALLBACK_UNIVERSE
 
 
@@ -155,7 +212,7 @@ def _bulk_download_batched(tickers: list, batch_size: int = 500,
                 interval="1d",
                 group_by="ticker",
                 auto_adjust=True,
-                threads=True,
+                threads=False,   # avoid SQLite cache contention under concurrent loads
                 progress=False,
             )
             single = len(batch) == 1
@@ -319,6 +376,61 @@ def _spread_proxy(highs: np.ndarray, lows: np.ndarray,
     return round(sum(ranges) / len(ranges), 2) if ranges else 0.0
 
 
+# ── Hot-tickers priority layer ────────────────────────────────────────────────
+
+def _build_hot_tickers() -> list:
+    """
+    Pull together the highest-conviction tickers from world_context:
+      - Earnings catalysts reporting today or tomorrow (BULLISH bias)
+      - Unusual bullish options flow (C/P ≥ 5×)
+      - StockTwits / social trending tickers
+      - Discovery agent candidates
+
+    These are prepended to the universe so they are always scanned first,
+    even if the bulk Polygon universe is limited or alphabetically sorted.
+    """
+    hot = []
+    try:
+        import world_context as wctx
+        ctx = wctx.get()
+
+        # Earnings catalysts today/tomorrow
+        for e in ctx["earnings"].get("upcoming", []):
+            if e.get("days", 99) <= 1 and e.get("direction") == "BULLISH":
+                hot.append(e["ticker"])
+
+        # Unusual bullish options flow
+        for o in ctx["social"].get("unusual_opts", []):
+            if o.get("bias") == "BULLISH" and o.get("call_put_ratio", 0) >= 5.0:
+                hot.append(o["ticker"])
+
+        # StockTwits trending
+        for t in ctx["social"].get("trending", [])[:8]:
+            hot.append(t["ticker"])
+
+    except Exception:
+        pass
+
+    try:
+        from discovery_agent import get_discovery_tickers
+        hot += get_discovery_tickers()[:15]
+    except Exception:
+        pass
+
+    # Deduplicate preserving order
+    seen = set()
+    result = []
+    for t in hot:
+        if t and t not in seen and t.isalpha() and 1 <= len(t) <= 5:
+            seen.add(t)
+            result.append(t.upper())
+
+    if result:
+        print(f"🔥 [Scanner] Hot-ticker priority layer ({len(result)}): {', '.join(result[:12])}"
+              + ("..." if len(result) > 12 else ""))
+    return result
+
+
 # ── Gate helpers ───────────────────────────────────────────────────────────────
 
 def _load_alerted_today() -> set:
@@ -342,6 +454,7 @@ def _check_news(ticker: str, verbose: bool = False) -> dict:
     Polygon news check for a single ticker.
     Returns: {has_recent: bool, hours_old: float, headline: str}
     Caller is responsible for rate-limit sleep between calls.
+    Retries once on 429 after a 15-second pause.
     """
     try:
         r = requests.get(
@@ -352,8 +465,18 @@ def _check_news(ticker: str, verbose: bool = False) -> dict:
         )
         if r.status_code == 429:
             if verbose:
-                print(f"   ⏳ {ticker}: rate limited")
-            return {"has_recent": False, "hours_old": 999, "headline": ""}
+                print(f"   ⏳ {ticker}: rate limited — retrying in 15s")
+            time.sleep(15)
+            r = requests.get(
+                f"{BASE_URL}/v2/reference/news",
+                params={"apiKey": POLYGON_API_KEY, "ticker": ticker,
+                        "limit": 5, "order": "desc"},
+                timeout=15,
+            )
+            if r.status_code == 429:
+                if verbose:
+                    print(f"   ⏳ {ticker}: still rate limited — skipping")
+                return {"has_recent": False, "hours_old": 999, "headline": ""}
         articles = r.json().get("results", [])
         now      = datetime.now(timezone.utc)
         for article in articles:
@@ -885,12 +1008,17 @@ def update_pick_accuracy():
 
 def scan_best_of_day(paper: bool = False, verbose: bool = False,
                       max_universe: int = 6000,
-                      extra_tickers: list = None) -> dict:
+                      extra_tickers: list = None,
+                      min_score: int = None,
+                      rvol_bypass: list = None) -> dict:
     """
     Full Best-of-Day selection pipeline.
 
     Returns the winner dict (empty dict if no qualifying stock found).
     WhatsApp message is in winner['whatsapp_msg'].
+
+    min_score: override MIN_SCORE constant (useful for pre-market sweep
+               where daily RVOL is not yet populated).
     """
     print("\n" + "═" * 55)
     print("🏆 [Best-of-Day] Starting selection pipeline...")
@@ -900,11 +1028,13 @@ def scan_best_of_day(paper: bool = False, verbose: bool = False,
     update_pick_accuracy()
 
     # ── Load universe ─────────────────────────────────────────────────────────
-    universe = _load_universe(max_universe)
-    if extra_tickers:
-        universe = list(dict.fromkeys(extra_tickers + universe))
-    universe = [t for t in universe if t.isalpha() and 1 <= len(t) <= 5]
-    n_universe = len(universe)
+    # Priority order: extra_tickers → hot tickers from world_context → bulk universe
+    hot_tickers = _build_hot_tickers()
+    universe    = _load_universe(max_universe)
+    priority    = list(dict.fromkeys((extra_tickers or []) + hot_tickers))
+    universe    = list(dict.fromkeys(priority + universe))
+    universe    = [t for t in universe if t.isalpha() and 1 <= len(t) <= 5]
+    n_universe  = len(universe)
 
     # ── Pre-fetch SPY + QQQ + all sector ETFs for multi-benchmark RS ─────────
     print("📈 [Best-of-Day] Fetching SPY + QQQ + sector ETFs...")
@@ -943,10 +1073,13 @@ def scan_best_of_day(paper: bool = False, verbose: bool = False,
             g0[t] = d
     print(f"🚦 Gate 0 (dvol ≥${DOLLAR_VOL_MIN//1000:.0f}k): {n_downloaded:,} → {len(g0):,} stocks")
 
-    # ── Gate 1: RVOL >= 2.0 ───────────────────────────────────────────────────
+    # ── Gate 1: RVOL >= 2.0 (bypassed for pre-market priority tickers) ─────────
+    _bypass = {t.upper() for t in (rvol_bypass or [])}
     g1 = {t: d for t, d in g0.items()
-          if _rvol(d["volumes"]) >= RVOL_MIN}
-    print(f"🚦 Gate 1 (RVOL ≥{RVOL_MIN:.1f}):  {len(g0):,} → {len(g1):,} stocks")
+          if _rvol(d["volumes"]) >= RVOL_MIN or t.upper() in _bypass}
+    bypassed = sum(1 for t in g1 if t.upper() in _bypass and _rvol(g0[t]["volumes"]) < RVOL_MIN)
+    print(f"🚦 Gate 1 (RVOL ≥{RVOL_MIN:.1f}):  {len(g0):,} → {len(g1):,} stocks"
+          + (f"  (+{bypassed} premarket bypass)" if bypassed else ""))
 
     # ── Gate 3: RSI 28–67 ─────────────────────────────────────────────────────
     g3 = {}
@@ -1052,19 +1185,20 @@ def scan_best_of_day(paper: bool = False, verbose: bool = False,
                   f"| {s['signals'][:45]}")
 
     # ── Filter by minimum score ────────────────────────────────────────────────
-    qualifiers = [s for s in scored if s["score"] >= MIN_SCORE]
-    print(f"\n🎯 Qualifying (score ≥{MIN_SCORE}): {len(qualifiers)} stocks")
+    score_threshold = min_score if min_score is not None else MIN_SCORE
+    qualifiers = [s for s in scored if s["score"] >= score_threshold]
+    print(f"\n🎯 Qualifying (score ≥{score_threshold}): {len(qualifiers)} stocks")
     if qualifiers:
         print(f"   Top catalyst: {qualifiers[0].get('news_category','general')}  "
               f"RS {qualifiers[0].get('rs_vs_spy', 0):+.1f}% vs SPY")
 
     if not qualifiers:
-        print(f"\n⚠️  [Best-of-Day] No stocks scored ≥{MIN_SCORE} — no pick today.")
+        print(f"\n⚠️  [Best-of-Day] No stocks scored ≥{score_threshold} — no pick today.")
         if not paper:
             from alerts import send_whatsapp as _sw
             _sw(
                 f"📊 Best-of-Day scan complete (7:45 AM)\n"
-                f"No qualifying stock today — nothing scored ≥{MIN_SCORE} pts.\n"
+                f"No qualifying stock today — nothing scored ≥{score_threshold} pts.\n"
                 f"Scanned {n_universe} tickers. Stay patient. 💤"
             )
         return {}
@@ -1077,39 +1211,149 @@ def scan_best_of_day(paper: bool = False, verbose: bool = False,
               f"RVOL {s['rvol']:.1f}x  RSI {s['rsi']:.0f}  "
               f"RS {s.get('rs_vs_spy',0):+.1f}%  cat={s.get('news_category','general')}")
 
-    # ── Claude ranking ─────────────────────────────────────────────────────────
-    claude = _claude_rank(top3, verbose=verbose)
-    rank   = claude.get("rank", [s["ticker"] for s in top3])
+    # ── Full agentic pipeline on top 3 (aggregator + validator + Claude) ───────
+    from concurrent.futures import ThreadPoolExecutor
+    from graph import GRAPH, make_initial_state
+    from alerts import send_alert as _send_alert
 
-    rank_map    = {t: i for i, t in enumerate(rank)}
-    top3_sorted = sorted(top3, key=lambda x: rank_map.get(x["ticker"], 99))
-    winner      = top3_sorted[0]
-    rank2       = top3_sorted[1] if len(top3_sorted) > 1 else {}
-    rank3       = top3_sorted[2] if len(top3_sorted) > 2 else {}
+    print(f"\n🤖 [Best-of-Day] Running top {len(top3)} through full agentic pipeline...")
 
-    print(f"\n🥇 WINNER: {winner['ticker']}  "
-          f"score={winner['score']}/225  ${winner['price']:.4f}")
-    print(f"   Why: {claude.get('why', '')[:110]}")
-    print(f"   Expected: {claude.get('expected_move', '')}")
-    print(f"   Risk: {claude.get('key_risk', '')}")
+    def _pipe(candidate: dict) -> dict:
+        ticker = candidate["ticker"]
+        state  = make_initial_state(ticker, paper_trading=paper)
+        state["news_triggered"] = True   # morning picks qualify for lower threshold
+        try:
+            result = GRAPH.invoke(state)
+        except Exception as _e:
+            print(f"   ❌ {ticker} pipeline error: {_e}")
+            result = {"signal": "HOLD", "confidence": 0, "ticker": ticker}
+        result["_candidate"] = candidate
+        return result
 
-    # ── Format WhatsApp message ────────────────────────────────────────────────
-    msg = _format_whatsapp(winner, rank2, rank3, claude, n_universe, len(g2))
-    winner["whatsapp_msg"] = msg
+    with ThreadPoolExecutor(max_workers=3) as _exe:
+        pipe_results = list(_exe.map(_pipe, top3))
 
-    print("\n" + "─" * 55)
-    print("📱 WhatsApp message:")
-    print("─" * 55)
-    print(msg)
-    print("─" * 55)
+    # Winner = BUY that passed all validator rules, highest confidence
+    buy_results = [
+        r for r in pipe_results
+        if r.get("final_signal", r.get("signal")) == "BUY"
+        and r.get("validator_passed", False)
+    ]
+    buy_results.sort(key=lambda r: r.get("confidence", 0), reverse=True)
 
-    # ── Send / paper-mode ─────────────────────────────────────────────────────
-    if paper:
-        print("\n📋 [PAPER MODE] WhatsApp NOT sent.")
+    if buy_results:
+        best   = buy_results[0]
+        cand   = best["_candidate"]
+        ticker = cand["ticker"]
+        price  = cand["price"]
+        conf   = best.get("confidence", 0)
+        agr    = best.get("agreement_score", 0.0)
+
+        print(f"\n🥇 WINNER: {ticker}  conf={conf}/100  agreement={agr:.0f}%")
+        print(f"   Signals: {best.get('signal_count_bull', 0)} bull / {best.get('signal_count_bear', 0)} bear")
+        print(f"   Entry:   ${best.get('entry_low', 0):.2f} – ${best.get('entry_high', 0):.2f}")
+        print(f"   Stop:    ${best.get('stop_loss', 0):.2f} ({best.get('stop_pct', 0):.1f}%)")
+        if best.get("reasoning"):
+            print(f"   {best['reasoning'][:110]}")
+
+        winner = dict(cand)
+        winner.update({
+            "entry_low":         best.get("entry_low",  0.0),
+            "entry_high":        best.get("entry_high", 0.0),
+            "stop_loss":         best.get("stop_loss",  0.0),
+            "stop_pct":          best.get("stop_pct",   0.0),
+            "targets":           best.get("targets",    []),
+            "reasoning":         best.get("reasoning",  ""),
+            "trade_horizon":     best.get("trade_horizon",     "swing"),
+            "horizon_reasoning": best.get("horizon_reasoning", ""),
+            "confidence":        conf,
+            "agreement_score":   agr,
+            "signal_count_bull": best.get("signal_count_bull", 0),
+            "signal_count_bear": best.get("signal_count_bear", 0),
+            "top_3_signals":     best.get("top_3_signals",   []),
+            "bullish_signals":   best.get("bullish_signals",  []),
+            "bearish_signals":   best.get("bearish_signals",  []),
+            "consensus":         best.get("consensus",        ""),
+            "main_risk":         best.get("main_risk",        ""),
+        })
+
+        _regime_str  = str((best.get("market_regime") or {}).get("regime", ""))
+        _sector_mom  = best.get("sector_momentum") or {}
+        _sector_str  = (
+            f"{_sector_mom.get('change_pct', 0):+.1f}% {_sector_mom.get('signal', '')}"
+            if _sector_mom else ""
+        )
+        _catalyst    = (best.get("news_summary") or "")[:100] or cand.get("news_headline", "")
+
+        winner["whatsapp_msg"] = (
+            f"BUY {ticker} @ ${price:.2f}  "
+            f"conf={conf}  agreement={agr:.0f}%  "
+            f"entry ${winner['entry_low']:.2f}–${winner['entry_high']:.2f}"
+        )
+
+        if paper:
+            print("\n📋 [PAPER MODE] Alert NOT sent.")
+        else:
+            _send_alert(
+                ticker=ticker,
+                signal="BUY",
+                price=price,
+                entry_low=winner["entry_low"],
+                entry_high=winner["entry_high"],
+                targets=winner["targets"],
+                stop=winner["stop_loss"],
+                reason=winner["reasoning"][:240],
+                confidence=conf,
+                horizon=winner["trade_horizon"],
+                horizon_reason=winner["horizon_reasoning"],
+                agreement_score=agr,
+                signal_count_bull=winner["signal_count_bull"],
+                signal_count_bear=winner["signal_count_bear"],
+                top_3_signals=winner["top_3_signals"],
+                bullish_signals=winner["bullish_signals"],
+                bearish_signals=winner["bearish_signals"],
+                consensus=winner["consensus"],
+                market_regime_str=_regime_str,
+                sector_str=_sector_str,
+                catalyst_str=_catalyst,
+                main_risk=winner["main_risk"],
+                det_score=winner.get("score", 0),
+            )
+            print("✅ [Best-of-Day] Alert sent via full agentic pipeline.")
+
     else:
-        from alerts import send_whatsapp
-        send_whatsapp(msg)
-        print("✅ [Best-of-Day] WhatsApp sent.")
+        # No BUY survived the full pipeline — fall back to classic Claude rank
+        print("\n⚠️  [Best-of-Day] No BUY signals survived validator — using Claude rank fallback")
+        claude = _claude_rank(top3, verbose=verbose)
+        rank   = claude.get("rank", [s["ticker"] for s in top3])
+
+        rank_map    = {t: i for i, t in enumerate(rank)}
+        top3_sorted = sorted(top3, key=lambda x: rank_map.get(x["ticker"], 99))
+        winner      = top3_sorted[0]
+        rank2       = top3_sorted[1] if len(top3_sorted) > 1 else {}
+        rank3       = top3_sorted[2] if len(top3_sorted) > 2 else {}
+
+        print(f"\n🥇 WINNER (fallback): {winner['ticker']}  "
+              f"score={winner['score']}/225  ${winner['price']:.4f}")
+        print(f"   Why: {claude.get('why', '')[:110]}")
+        print(f"   Expected: {claude.get('expected_move', '')}")
+        print(f"   Risk: {claude.get('key_risk', '')}")
+
+        msg = _format_whatsapp(winner, rank2, rank3, claude, n_universe, len(g2))
+        winner["whatsapp_msg"] = msg
+
+        print("\n" + "─" * 55)
+        print("📱 WhatsApp message:")
+        print("─" * 55)
+        print(msg)
+        print("─" * 55)
+
+        if paper:
+            print("\n📋 [PAPER MODE] WhatsApp NOT sent.")
+        else:
+            from alerts import send_whatsapp
+            send_whatsapp(msg)
+            print("✅ [Best-of-Day] WhatsApp sent (fallback format).")
 
     # ── Log to best_picks_log.csv ──────────────────────────────────────────────
     log_best_pick(winner)

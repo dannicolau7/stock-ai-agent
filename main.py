@@ -302,17 +302,81 @@ async def monitoring_loop():
 
     while True:
         try:
-            if is_market_open():
-                # Merge static watchlist with discovery candidates (deduped)
-                from discovery_agent import get_discovery_tickers
+            now_est   = datetime.now(tz=EST)
+            h, m      = now_est.hour, now_est.minute
+            weekday   = now_est.weekday() < 5
+            premarket = weekday and (8, 0) <= (h, m) < (9, 30)   # 8:00–9:29 AM ET
+            intraday  = is_market_open()                           # 9:30–4:00 PM ET
+
+            if intraday or premarket:
+                from discovery_agent   import get_discovery_tickers
+                from momentum_screener import get_momentum_candidates
+                import world_context as wctx
+                ctx = wctx.get()
+
                 discovery = get_discovery_tickers()
-                scan_list = list(dict.fromkeys(TICKERS + discovery[:10]))
+                momentum  = get_momentum_candidates()
+
+                from top_movers import get_top_movers
+                movers = get_top_movers()
+
+                # Earnings hot plays reporting today or tomorrow (BULLISH bias)
+                earnings_plays = [
+                    e["ticker"]
+                    for e in ctx["earnings"].get("upcoming", [])
+                    if e.get("days", 99) <= 1 and e.get("direction") == "BULLISH"
+                ]
+
+                # Tickers with extreme bullish options flow (C/P ≥ 10×)
+                opts_tickers = [
+                    o["ticker"]
+                    for o in ctx["social"].get("unusual_opts", [])
+                    if o.get("bias") == "BULLISH" and o.get("call_put_ratio", 0) >= 10.0
+                ]
+
+                # Pre-market: add gap-up candidates from premarket_scanner
+                premarket_tickers: list = []
+                if premarket:
+                    try:
+                        from premarket_scanner import scan_premarket_gaps
+                        pm_gaps = scan_premarket_gaps(TICKERS)
+                        premarket_tickers = [g["ticker"] for g in pm_gaps if g.get("gap_pct", 0) >= 2.0]
+                        if premarket_tickers:
+                            print(f"🌅 [Monitor] Pre-market gaps: {premarket_tickers}")
+                    except Exception as _pm_e:
+                        print(f"⚠️  [Monitor] Pre-market scan error: {_pm_e}")
+
+                # Priority order: watchlist → pre-market gaps → earnings → options →
+                #                 momentum → top movers → discovery
+                scan_list = list(dict.fromkeys(
+                    TICKERS
+                    + premarket_tickers
+                    + earnings_plays
+                    + opts_tickers
+                    + momentum[:5]       # top 5 momentum screener picks
+                    + movers[:15]        # today's top gainers + most active
+                    + discovery[:10]
+                ))
+
+                mode_label = "🌅 PRE-MARKET" if premarket else "📈 INTRADAY"
+                print(f"\n{mode_label} [Monitor] Scanning {len(scan_list)} tickers "
+                      f"({now_est.strftime('%H:%M ET')})  "
+                      f"watchlist={len(TICKERS)}  movers={len(movers[:15])}  "
+                      f"earnings={len(earnings_plays)}  opts={len(opts_tickers)}")
+                if earnings_plays:
+                    print(f"   📅 Earnings catalysts: {earnings_plays}")
+                if opts_tickers:
+                    print(f"   🎯 Options flow: {opts_tickers}")
+                if momentum:
+                    print(f"   🚀 Momentum: {momentum[:5]}")
+                if movers:
+                    print(f"   📈 Movers: {movers[:15]}")
+
                 await asyncio.gather(*[_run_gated(t) for t in scan_list])
             else:
-                now_est = datetime.now(tz=EST)
                 print(
                     f"🕐 [Monitor] Market closed "
-                    f"({now_est.strftime('%a %H:%M EST')}) — "
+                    f"({now_est.strftime('%a %H:%M ET')}) — "
                     f"next check in {INTERVAL}s"
                 )
         except Exception as e:
@@ -338,6 +402,7 @@ async def lifespan(app: FastAPI):
     from portfolio_agent    import portfolio_agent_loop, init_positions_table
     from reflection_agent   import reflection_agent_loop
     from performance_tracker import init_db, performance_tracker_loop
+    from momentum_screener  import momentum_screener_loop
     import task_supervisor as sup
 
     init_db()
@@ -360,6 +425,7 @@ async def lifespan(app: FastAPI):
     sup.start("portfolio",  lambda: portfolio_agent_loop(paper=PAPER))
     sup.start("tracker",    performance_tracker_loop)
     sup.start("reflection", lambda: reflection_agent_loop(paper=PAPER))
+    sup.start("momentum",   lambda: momentum_screener_loop(paper=PAPER, watchlist_fn=wl.load))
 
     yield
     await sup.cancel_all()
@@ -700,6 +766,46 @@ _premarket_cache: dict = {}
 async def api_premarket():
     """Return cached pre-market gap results (populated by the 8:30 AM scheduler job)."""
     return JSONResponse(_json_safe(_premarket_cache or {"gaps": [], "scanned_at": None, "count": 0}))
+
+
+# ── Intel / Momentum / Alerts endpoints ───────────────────────────────────────
+
+@app.get("/api/intel")
+async def api_intel():
+    """World context snapshot: macro, geo, earnings, breadth, social."""
+    import world_context as wctx
+    ctx = wctx.get()
+    return JSONResponse(_json_safe({
+        "macro":    ctx["macro"],
+        "geo":      ctx["geo"],
+        "earnings": ctx["earnings"],
+        "breadth":  ctx["breadth"],
+        "social":   ctx["social"],
+    }))
+
+
+@app.get("/api/momentum")
+async def api_momentum():
+    """Momentum screener results from the last 2-hour scan."""
+    import world_context as wctx
+    ctx    = wctx.get()
+    social = ctx.get("social", {})
+    return JSONResponse(_json_safe({
+        "candidates": social.get("momentum_picks", []),
+        "tickers":    social.get("momentum_candidates", []),
+        "updated_at": social.get("momentum_updated_at"),
+    }))
+
+
+@app.get("/api/alerts")
+async def api_alerts():
+    """Recent BUY/SELL signals (last 30) from signals_log.csv."""
+    signals = logger.read_log(limit=200)
+    alerts  = [s for s in signals if s.get("signal") in ("BUY", "SELL")]
+    return JSONResponse(_json_safe({
+        "alerts": list(reversed(alerts[-30:])),
+        "total":  len(alerts),
+    }))
 
 
 # ── Backtest endpoint ──────────────────────────────────────────────────────────

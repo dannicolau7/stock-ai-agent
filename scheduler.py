@@ -23,8 +23,6 @@ scheduler.py — Full-day trading schedule.
 """
 
 import asyncio
-import os
-import signal
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
@@ -56,7 +54,7 @@ def _mark_fired(event: str):
     _fired_today[event] = _today()
 
 
-def _in_window(hour: int, minute: int, window_min: int = 3) -> bool:
+def _in_window(hour: int, minute: int, window_min: int = 10) -> bool:
     now    = datetime.now(tz=EST)
     target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
     delta  = (now - target).total_seconds()
@@ -361,16 +359,14 @@ async def _send_good_night(daily_log: list):
     today = _today()
     sigs  = [e for e in daily_log if e.get("timestamp", "")[:10] == today]
     msg   = (
-        f"🌙 Good night! Argus shutting down.\n\n"
+        f"🌙 Good night! Argus going to sleep.\n\n"
         f"Today's summary:\n"
         f"- Signals fired: {len(sigs)}\n"
         f"- Scans completed: {sum(1 for v in _fired_today.values() if v == today)}\n\n"
-        f"Agent will restart at 3:00 AM.\nSleep well! 😴"
+        f"Agent continues running overnight.\nSleep well! 😴"
     )
     send_whatsapp(msg)
-    print("🌙 [Scheduler] Good night — shutting down agent...")
-    await asyncio.sleep(2)
-    os.kill(os.getpid(), signal.SIGTERM)
+    print("🌙 [Scheduler] Good night — daily schedule complete.")
 
 
 # ── Main scheduler loop ────────────────────────────────────────────────────────

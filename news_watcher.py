@@ -302,7 +302,7 @@ async def news_watcher_loop():
 
     # ── Seed seen IDs so startup doesn't flood old articles ─────────────────
     print("📡 [NewsWatcher] Seeding article history...")
-    seed = _fetch_latest_news(limit=100)
+    seed = await loop.run_in_executor(None, _fetch_latest_news, 100)
     for a in seed:
         if a.get("id"):
             _seen_ids.add(a["id"])
@@ -313,7 +313,7 @@ async def news_watcher_loop():
             await asyncio.sleep(POLL_INTERVAL_S)
 
             # ── 1. Fetch latest news ────────────────────────────────────────
-            articles = _fetch_latest_news(limit=50)
+            articles = await loop.run_in_executor(None, _fetch_latest_news, 50)
             new_arts = _filter_new(articles)
 
             now_str = datetime.now().strftime("%H:%M")

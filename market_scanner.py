@@ -1315,7 +1315,7 @@ def scan_best_of_day(verbose: bool = False,
                 main_risk=winner["main_risk"],
                 det_score=winner.get("score", 0),
             )
-            print("✅ [Best-of-Day] Alert sent via full agentic pipeline.")
+        print("✅ [Best-of-Day] Alert sent via full agentic pipeline.")
 
     else:
         # No BUY survived the full pipeline — fall back to classic Claude rank

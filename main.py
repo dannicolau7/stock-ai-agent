@@ -29,64 +29,151 @@ import uvicorn
 
 import config
 from graph import GRAPH, make_initial_state
-import watchlist_manager as wl
 import logger
 
 
 # ── CLI args ───────────────────────────────────────────────────────────────────
 
 def _parse_args():
-    p = argparse.ArgumentParser(description="Argus")
-    p.add_argument("--ticker",   nargs="+", default=None,  help="One or more ticker symbols (e.g. --ticker BZAI AWRE)")
+    p = argparse.ArgumentParser(description="Argus — Autonomous Market Intelligence")
     p.add_argument("--interval", type=int, default=300, help="Scan interval seconds (default 300 = 5 min)")
     p.add_argument("--port",     type=int, default=8000, help="Dashboard port (default 8000)")
-    # Watchlist management (these exit immediately without starting the server)
-    p.add_argument("--add",    metavar="TICKER", default=None, help="Add ticker to watchlist and exit")
-    p.add_argument("--remove", metavar="TICKER", default=None, help="Remove ticker from watchlist and exit")
-    p.add_argument("--list",   action="store_true",            help="List watchlist tickers and exit")
     args, _ = p.parse_known_args()
     return args
 
-# ── Safe module-level defaults (populated by _setup_from_args at startup) ──────
-TICKERS  = ["BZAI"]
-TICKER   = "BZAI"
-INTERVAL = 300
-PORT     = 8000
-EST      = ZoneInfo("America/New_York")
+# ── Safe module-level defaults ─────────────────────────────────────────────────
+TICKERS: list  = []   # populated by build_scan_list() at runtime
+TICKER:  str   = ""   # first ticker in TICKERS (used as API fallback)
+INTERVAL       = 300
+PORT           = 8000
+EST            = ZoneInfo("America/New_York")
+_scan_built_at: float = 0.0   # epoch time of last build_scan_list() call
 
 
 def _setup_from_args() -> None:
     """Parse CLI args and populate module-level config. Called only from __main__."""
-    global TICKERS, TICKER, INTERVAL, PORT
-
-    args = _parse_args()
-
-    # Handle watchlist management commands immediately (no server needed)
-    if args.add:
-        wl.add(args.add)
-        raise SystemExit(0)
-    if args.remove:
-        wl.remove(args.remove)
-        raise SystemExit(0)
-    if args.list:
-        wl.list_tickers()
-        raise SystemExit(0)
-
-    # Resolve tickers: CLI flag → .env → watchlist → default
-    watchlist   = wl.load()
-    cli_tickers = args.ticker
-    if cli_tickers:
-        TICKERS = [t.upper() for t in cli_tickers]
-    elif watchlist:
-        TICKERS = watchlist
-    elif config.TICKER:
-        TICKERS = [t.strip().upper() for t in config.TICKER.split() if t.strip()]
-    else:
-        TICKERS = ["BZAI"]
-
-    TICKER   = TICKERS[0]
+    global INTERVAL, PORT
+    args     = _parse_args()
     INTERVAL = args.interval
     PORT     = args.port
+
+
+# ── Autonomous scan list builder ───────────────────────────────────────────────
+
+def build_scan_list() -> list:
+    """
+    Build the scan list from all autonomous sources.
+    Called at startup and refreshed every 30 minutes.
+    Returns a deduplicated list of tickers ordered by priority.
+    """
+    global TICKERS, TICKER, _scan_built_at
+    tickers = []
+
+    # 1. Top movers right now (biggest source — 5-min cache)
+    try:
+        from top_movers import get_top_movers
+        movers = get_top_movers()
+        tickers += movers
+        print(f"   🚀 Top movers: {movers[:10]}")
+    except Exception as e:
+        print(f"   ⚠️  Top movers: {e}")
+
+    # 2. Momentum screener (2-hour scan)
+    try:
+        from momentum_screener import get_momentum_candidates
+        momentum = get_momentum_candidates()
+        tickers += momentum
+        if momentum:
+            print(f"   📈 Momentum: {momentum[:5]}")
+    except Exception as e:
+        print(f"   ⚠️  Momentum: {e}")
+
+    # 3. Discovery agent (4-hour Claude-driven scan)
+    try:
+        from discovery_agent import get_discovery_tickers
+        discovery = get_discovery_tickers()
+        tickers += discovery
+        if discovery:
+            print(f"   🔍 Discovery: {discovery[:5]}")
+    except Exception as e:
+        print(f"   ⚠️  Discovery: {e}")
+
+    # 4. Options flow unusual activity
+    try:
+        import world_context as wctx
+        social = wctx.get().get("social", {})
+        opts = [o["ticker"] for o in social.get("unusual_opts", [])[:10]
+                if isinstance(o, dict) and "ticker" in o]
+        tickers += opts
+        if opts:
+            print(f"   🎯 Options flow: {opts}")
+    except Exception as e:
+        print(f"   ⚠️  Options flow: {e}")
+
+    # 5. Earnings hot plays
+    try:
+        import world_context as wctx
+        earnings = wctx.get().get("earnings", {})
+        hot = [p["ticker"] for p in earnings.get("hot_plays", [])[:10]
+               if isinstance(p, dict) and "ticker" in p]
+        tickers += hot
+        if hot:
+            print(f"   📅 Earnings: {hot}")
+    except Exception as e:
+        print(f"   ⚠️  Earnings: {e}")
+
+    # 6. EOD setups from yesterday
+    try:
+        import json as _json, os as _os
+        path = _os.path.join("data", "tomorrow_watchlist.json")
+        if _os.path.exists(path):
+            eod = [s["ticker"] for s in _json.load(open(path)).get("setups", [])
+                   if s.get("ticker")]
+            tickers += eod
+            if eod:
+                print(f"   📊 EOD setups: {eod}")
+    except Exception as e:
+        print(f"   ⚠️  EOD setups: {e}")
+
+    # 7. Pre-market gaps
+    try:
+        import json as _json, os as _os
+        path = _os.path.join("data", "prep_alert_list.json")
+        if _os.path.exists(path):
+            prep = [s.get("ticker") for s in _json.load(open(path)).get("stocks", [])
+                    if s.get("ticker")]
+            tickers += prep
+            if prep:
+                print(f"   🌅 Pre-market: {prep}")
+    except Exception as e:
+        print(f"   ⚠️  Pre-market: {e}")
+
+    # 8. Social trending
+    try:
+        import world_context as wctx
+        trending = wctx.get().get("social", {}).get("trending", [])[:5]
+        if trending:
+            tickers += trending
+            print(f"   📱 Trending: {trending}")
+    except Exception as e:
+        print(f"   ⚠️  Trending: {e}")
+
+    # Deduplicate preserving order
+    seen   = set()
+    unique = []
+    for t in tickers:
+        if t and isinstance(t, str) and t not in seen:
+            seen.add(t)
+            unique.append(t.upper().strip())
+
+    TICKERS         = unique
+    TICKER          = unique[0] if unique else ""
+    _scan_built_at  = __import__("time").time()
+
+    print(f"\n✅ Scan list: {len(unique)} stocks")
+    if unique:
+        print(f"   {unique[:20]}")
+    return unique
 
 
 # ── Market hours helpers ───────────────────────────────────────────────────────
@@ -206,7 +293,7 @@ def _run_sync(ticker: str,
 
 
 def _store_result(result: dict):
-    ticker = result.get("ticker", TICKER)
+    ticker = result.get("ticker") or (TICKERS[0] if TICKERS else "")
 
     bars  = result.get("bars", [])
     news  = result.get("raw_news", [])
@@ -230,7 +317,7 @@ def _store_result(result: dict):
 
 
 def _update_signal_memory(result: dict):
-    ticker  = result.get("ticker", TICKER)
+    ticker  = result.get("ticker") or (TICKERS[0] if TICKERS else "")
     signal  = result.get("signal", "HOLD")
     price   = result.get("current_price", 0.0)
 
@@ -269,7 +356,7 @@ def _check_exits(ticker: str, price: float) -> str | None:
 
 
 async def run_once(ticker: str = None, news_triggered: bool = False):
-    ticker = ticker or TICKER
+    ticker = ticker or (TICKERS[0] if TICKERS else "")
     loop   = asyncio.get_running_loop()
     # Suppress re-alerting if this ticker already has an active BUY position
     already_alerted = ticker in _app_state.signal_memory
@@ -311,7 +398,7 @@ async def _send_daily_report():
     today    = datetime.now(tz=EST).strftime("%Y-%m-%d")
     today_signals = [e for e in _app_state.daily_log if e["timestamp"][:10] == today]
 
-    lines = [f"📅 Daily Report — {TICKER} — {today}"]
+    lines = [f"📅 Daily Report — Argus Autonomous — {today}"]
     if not today_signals:
         lines.append("No BUY/SELL signals fired today.")
     else:
@@ -326,7 +413,7 @@ async def _send_daily_report():
 
     try:
         from alerts import send_push, send_whatsapp
-        send_push(f"Daily Report — {TICKER}", report)
+        send_push("Daily Report — Argus", report)
         send_whatsapp(report)
     except Exception as e:
         print(f"❌ [Monitor] Daily report delivery failed: {e}")
@@ -335,115 +422,56 @@ async def _send_daily_report():
 # ── Monitoring loop ────────────────────────────────────────────────────────────
 
 async def monitoring_loop():
-    print(f"🚀 Argus — Agentic Market Intelligence  [🔴 LIVE]  tickers={', '.join(TICKERS)}  interval={INTERVAL}s")
-    print(f"📊 Dashboard → http://localhost:{PORT}")
+    print(
+        f"\n🤖 ARGUS — Full Autonomous Mode\n"
+        f"   No watchlist — finding stocks independently\n"
+        f"   Sources: movers + momentum + discovery +\n"
+        f"            options + earnings + EOD + premarket\n"
+        f"   Refreshing every 30 minutes\n"
+        f"📊 Dashboard → http://localhost:{PORT}\n"
+    )
 
-    # Print watchlist on startup
-    saved = wl.load()
-    if saved:
-        print(f"📋 Watchlist: {', '.join(saved)}")
-    print()
-
-    # Semaphore limits concurrent Polygon-hitting pipelines to protect free tier (5 req/min)
+    # Semaphore limits concurrent Polygon-hitting pipelines to protect free tier
     _sem = asyncio.Semaphore(2)
 
     async def _run_gated(t: str):
         async with _sem:
             await run_once(t)
 
+    _SCAN_REFRESH_S = 30 * 60   # rebuild scan list every 30 minutes
+
+    # Build initial scan list (retry until non-empty)
+    print("🔄 [Monitor] Building initial scan list...")
+    loop = asyncio.get_running_loop()
+    scan_list = await loop.run_in_executor(None, build_scan_list)
+    while not scan_list:
+        print("⏳ [Monitor] No stocks found yet — retrying in 60s")
+        await asyncio.sleep(60)
+        scan_list = await loop.run_in_executor(None, build_scan_list)
+
     while True:
         try:
             now_est   = datetime.now(tz=EST)
             h, m      = now_est.hour, now_est.minute
             weekday   = now_est.weekday() < 5
-            premarket = weekday and (8, 0) <= (h, m) < (9, 30)   # 8:00–9:29 AM ET
-            intraday  = is_market_open()                           # 9:30–4:00 PM ET
+            premarket = weekday and (8, 0) <= (h, m) < (9, 30)
+            intraday  = is_market_open()
+
+            # Refresh scan list every 30 minutes
+            import time as _time
+            if _time.time() - _scan_built_at >= _SCAN_REFRESH_S:
+                print("🔄 [Monitor] Refreshing scan list...")
+                scan_list = await loop.run_in_executor(None, build_scan_list)
+                if not scan_list:
+                    print("⏳ [Monitor] Scan list empty after refresh — keeping previous")
+                    scan_list = TICKERS or []
+                else:
+                    print(f"🔄 [Monitor] Scan list refreshed: {len(scan_list)} stocks")
 
             if intraday or premarket:
-                from discovery_agent   import get_discovery_tickers
-                from momentum_screener import get_momentum_candidates
-                import world_context as wctx
-                ctx = wctx.get()
-
-                discovery = get_discovery_tickers()
-                momentum  = get_momentum_candidates()
-
-                from top_movers import get_top_movers
-                movers = get_top_movers()
-
-                # Earnings hot plays reporting today or tomorrow (BULLISH bias)
-                earnings_plays = [
-                    e["ticker"]
-                    for e in ctx["earnings"].get("upcoming", [])
-                    if e.get("days", 99) <= 1 and e.get("direction") == "BULLISH"
-                ]
-
-                # Tickers with extreme bullish options flow (C/P ≥ 10×)
-                opts_tickers = [
-                    o["ticker"]
-                    for o in ctx["social"].get("unusual_opts", [])
-                    if o.get("bias") == "BULLISH" and o.get("call_put_ratio", 0) >= 10.0
-                ]
-
-                # Pre-market: add gap-up candidates from premarket_scanner
-                premarket_tickers: list = []
-                if premarket:
-                    try:
-                        from premarket_scanner import scan_premarket_gaps
-                        pm_gaps = scan_premarket_gaps(TICKERS)
-                        premarket_tickers = [g["ticker"] for g in pm_gaps if g.get("gap_pct", 0) >= 2.0]
-                        if premarket_tickers:
-                            print(f"🌅 [Monitor] Pre-market gaps: {premarket_tickers}")
-                    except Exception as _pm_e:
-                        print(f"⚠️  [Monitor] Pre-market scan error: {_pm_e}")
-
-                # Today's pre-market picks (BUY AT OPEN from 9:10 AM prep alert)
-                todays_picks: list = []
-                try:
-                    from premarket_scanner import load_todays_watchlist
-                    todays_picks = load_todays_watchlist()
-                    if todays_picks:
-                        print(f"🌅 [Monitor] Today's pre-market picks: {todays_picks}")
-                except Exception:
-                    pass
-
-                # Stocks pre-identified by yesterday's EOD scanner
-                eod_picks: list = []
-                try:
-                    from eod_scanner import load_tomorrow_tickers
-                    eod_picks = load_tomorrow_tickers()
-                    if eod_picks:
-                        print(f"📅 [Monitor] Yesterday's EOD picks: {eod_picks}")
-                except Exception:
-                    pass
-
-                # Priority order: watchlist → EOD picks → today's picks → pre-market gaps →
-                #                 earnings → options → momentum → movers → discovery
-                scan_list = list(dict.fromkeys(
-                    TICKERS
-                    + eod_picks          # pre-identified by yesterday's EOD scanner
-                    + todays_picks
-                    + premarket_tickers
-                    + earnings_plays
-                    + opts_tickers
-                    + momentum[:5]       # top 5 momentum screener picks
-                    + movers[:15]        # today's top gainers + most active
-                    + discovery[:10]
-                ))
-
                 mode_label = "🌅 PRE-MARKET" if premarket else "📈 INTRADAY"
-                print(f"\n{mode_label} [Monitor] Scanning {len(scan_list)} tickers "
-                      f"({now_est.strftime('%H:%M ET')})  "
-                      f"watchlist={len(TICKERS)}  movers={len(movers[:15])}  "
-                      f"earnings={len(earnings_plays)}  opts={len(opts_tickers)}")
-                if earnings_plays:
-                    print(f"   📅 Earnings catalysts: {earnings_plays}")
-                if opts_tickers:
-                    print(f"   🎯 Options flow: {opts_tickers}")
-                if momentum:
-                    print(f"   🚀 Momentum: {momentum[:5]}")
-                if movers:
-                    print(f"   📈 Movers: {movers[:15]}")
+                print(f"\n{mode_label} [Monitor] Scanning {len(scan_list)} stocks "
+                      f"({now_est.strftime('%H:%M ET')})")
 
                 await asyncio.gather(*[_run_gated(t) for t in scan_list])
             else:
@@ -487,18 +515,19 @@ async def lifespan(app: FastAPI):
         signal_memory=_app_state.signal_memory))
     sup.start("news",       news_watcher_loop)
     sup.start("yf_news",    yf_news_watcher_loop)
-    sup.start("spike",      lambda: spike_watcher_loop(run_once, wl.load))
+    from top_movers import get_top_movers
+    sup.start("spike",      lambda: spike_watcher_loop(run_once, get_top_movers))
     sup.start("edgar",      edgar_watcher_loop)
     sup.start("geo",        geo_watcher_loop)
     sup.start("macro",      macro_watcher_loop)
-    sup.start("earnings",   lambda: earnings_watcher_loop(extra_tickers=TICKERS))
+    sup.start("earnings",   earnings_watcher_loop)
     sup.start("breadth",    breadth_watcher_loop)
-    sup.start("social",     lambda: social_watcher_loop(extra_tickers=TICKERS))
-    sup.start("discovery",  lambda: discovery_agent_loop(static_watchlist_fn=wl.load))
+    sup.start("social",     social_watcher_loop)
+    sup.start("discovery",  discovery_agent_loop)
     sup.start("portfolio",  portfolio_agent_loop)
     sup.start("tracker",    performance_tracker_loop)
     sup.start("reflection", reflection_agent_loop)
-    sup.start("momentum",   lambda: momentum_screener_loop(watchlist_fn=wl.load))
+    sup.start("momentum",   momentum_screener_loop)
 
     yield
     await sup.cancel_all()
@@ -563,7 +592,7 @@ async def serve_dashboard():
 
 @app.get("/api/state")
 async def api_state(ticker: str = None):
-    t = (ticker or TICKER).upper()
+    t = (ticker or (TICKERS[0] if TICKERS else "")).upper()
     state   = _app_state.ticker_states.get(t, {})
     history = _app_state.histories.get(t, [])
     return JSONResponse(_json_safe({
@@ -571,13 +600,14 @@ async def api_state(ticker: str = None):
         "history":       history,
         "ticker":        t,
         "tickers":       TICKERS,
+        "scan_count":    len(TICKERS),
         "market_open":   is_market_open(),
     }))
 
 
 @app.get("/api/bars")
 async def api_bars(ticker: str = None):
-    t    = (ticker or TICKER).upper()
+    t    = (ticker or (TICKERS[0] if TICKERS else "")).upper()
     bars = _app_state.bars_map.get(t, [])
     tv_bars = [
         {
@@ -594,8 +624,9 @@ async def api_bars(ticker: str = None):
 
 
 @app.get("/api/news")
-async def api_news():
-    raw  = _app_state.news_map.get(TICKER, [])
+async def api_news(ticker: str = None):
+    t    = (ticker or (TICKERS[0] if TICKERS else "")).upper()
+    raw  = _app_state.news_map.get(t, [])
     news = [
         {
             "title":     n.get("title", ""),
@@ -605,11 +636,12 @@ async def api_news():
         }
         for n in raw[:10]
     ]
-    return JSONResponse(_json_safe({"news": news, "ticker": TICKER}))
+    return JSONResponse(_json_safe({"news": news, "ticker": t}))
 
 
 @app.get("/api/watchlist")
 async def api_watchlist():
+    """Return current autonomous scan list with latest signal state per ticker."""
     rows = []
     for t in TICKERS:
         s = _app_state.ticker_states.get(t, {})
@@ -620,18 +652,23 @@ async def api_watchlist():
             "price":      s.get("current_price", 0),
             "rsi":        s.get("rsi", 0),
         })
-    return JSONResponse(_json_safe({"watchlist": rows, "memory": _app_state.signal_memory}))
+    return JSONResponse(_json_safe({
+        "scan_list": rows,
+        "count":     len(rows),
+        "memory":    _app_state.signal_memory,
+    }))
 
 
 @app.post("/api/run")
 async def api_trigger_run():
+    scan = list(TICKERS[:10])   # cap at 10 for manual trigger
     async def _run_all():
-        for i, t in enumerate(TICKERS):
+        for i, t in enumerate(scan):
             if i > 0:
                 await asyncio.sleep(20)
             await run_once(t)
     asyncio.create_task(_run_all())
-    return {"status": "triggered", "tickers": TICKERS}
+    return {"status": "triggered", "tickers": scan}
 
 
 @app.get("/api/health")
@@ -772,22 +809,17 @@ async def api_portfolio():
     }))
 
 
-@app.get("/api/watchlist/saved")
-async def api_watchlist_saved():
-    """Return the persisted watchlist.json tickers."""
-    return JSONResponse(_json_safe({"tickers": wl.load()}))
-
-
-@app.post("/api/watchlist/add/{ticker}")
-async def api_watchlist_add(ticker: str):
-    updated = wl.add(ticker.upper())
-    return {"tickers": updated}
-
-
-@app.delete("/api/watchlist/remove/{ticker}")
-async def api_watchlist_remove(ticker: str):
-    updated = wl.remove(ticker.upper())
-    return {"tickers": updated}
+@app.get("/api/scan-list")
+async def api_scan_list():
+    """Return current autonomous scan list and metadata."""
+    import time as _t
+    age_min = round((_t.time() - _scan_built_at) / 60, 1) if _scan_built_at else None
+    return JSONResponse(_json_safe({
+        "tickers":    TICKERS,
+        "count":      len(TICKERS),
+        "age_min":    age_min,
+        "autonomous": True,
+    }))
 
 
 # ── Sector rotation heatmap ────────────────────────────────────────────────────
@@ -890,7 +922,7 @@ async def api_backtest(body: dict):
     Returns win_rate, avg_gain_pct, avg_loss_pct, total_pnl_pct, max_drawdown_pct,
             total_trades, trades[], per_ticker{}
     """
-    tickers = [str(t).upper().strip() for t in body.get("tickers", [TICKER])]
+    tickers = [str(t).upper().strip() for t in body.get("tickers", TICKERS[:3] or ["SPY"])]
     period  = str(body.get("period", "1y"))
     if period not in ("3mo", "6mo", "1y", "2y"):
         period = "1y"
@@ -987,7 +1019,7 @@ async def api_agent_flow():
 async def api_pipeline_run(ticker: str = None):
     """Run a pipeline audit and return a detailed per-node trace."""
     global _last_trace
-    t = (ticker or TICKER).upper()
+    t = (ticker or (TICKERS[0] if TICKERS else "SPY")).upper()
     try:
         from graph import run_pipeline_audit, make_initial_state as _mis
         import time as _time

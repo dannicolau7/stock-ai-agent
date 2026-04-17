@@ -154,7 +154,7 @@ def _fetch_sector(ticker: str) -> str:
 
 
 def run_data_agent(state: dict) -> dict:
-    ticker = state.get("ticker", "BZAI")
+    ticker = state.get("ticker", "")
     print(f"📡 [DataAgent] Fetching data for {ticker}...")
 
     try:

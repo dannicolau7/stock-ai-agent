@@ -69,7 +69,7 @@ BEST_PICKS_COLUMNS = [
 ]
 
 FALLBACK_UNIVERSE = [
-    "BBAI", "SOUN", "BZAI", "AWRE", "LTRX", "CXAI", "GFAI", "AITX", "POET",
+    "CXAI", "GFAI", "AITX", "POET",
     "IONQ", "RGTI", "QUBT", "KULR", "CIFR", "BTBT", "PRCT", "NVAX", "IOVA",
     "NVDA", "AMD", "SMCI", "MSTR", "PLTR", "RKLB", "JOBY", "ACHR", "LUNR",
     "FCEL", "PLUG", "BLNK", "CHPT", "AMC", "GME",

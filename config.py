@@ -20,7 +20,7 @@ PUSHOVER_APP_TOKEN = os.getenv("PUSHOVER_APP_TOKEN", "")
 PUSHOVER_USER_KEY = os.getenv("PUSHOVER_USER_KEY", "")
 
 # App
-TICKER = os.getenv("TICKER", "BZAI")
+TICKER = os.getenv("TICKER", "")
 MONITOR_INTERVAL = int(os.getenv("MONITOR_INTERVAL", "60"))
 
 # Circuit breaker

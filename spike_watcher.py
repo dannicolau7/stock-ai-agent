@@ -220,10 +220,10 @@ async def spike_watcher_loop(run_once_fn, get_tickers_fn):
 # ── Standalone test ────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
-    import watchlist_manager as wl
+    from top_movers import get_top_movers
 
     universe = _load_full_universe()
-    watchlist = wl.load() or ["AWRE", "BZAI", "AAL"]
+    watchlist = get_top_movers()
     chunk    = universe[:CHUNK_SIZE] if universe else watchlist
     to_check = list(dict.fromkeys(watchlist + chunk))
 

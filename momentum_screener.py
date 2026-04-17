@@ -38,7 +38,7 @@ EST = ZoneInfo("America/New_York")
 MOMENTUM_UNIVERSE = [
     # AI / Tech growth
     "NVDA", "AMD", "PLTR", "SMCI", "ARM", "IONQ", "RGTI", "QUBT",
-    "SOUN", "BBAI", "BZAI", "CXAI", "AITX", "GFAI",
+    "CXAI", "AITX", "GFAI",
     # Biotech / Healthcare catalyst plays
     "MRNA", "NVAX", "IOVA", "BNTX", "RCKT", "ACHR",
     # Energy / Commodity momentum
@@ -46,7 +46,7 @@ MOMENTUM_UNIVERSE = [
     # Financials (earnings leverage)
     "GS", "JPM", "BAC", "MS", "C", "WFC",
     # Small-cap momentum
-    "LTRX", "AWRE", "KULR", "CIFR", "RKLB", "JOBY",
+    "KULR", "CIFR", "RKLB", "JOBY",
     # ETF momentum indicators
     "TQQQ", "SOXL", "LABU",
     # Consumer / Retail

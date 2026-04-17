@@ -88,10 +88,17 @@ def validator_node(state: dict) -> dict:
         )
 
     # ── Rule 8 — Confidence gate ───────────────────────────────────────────────
-    if confidence < 65 and signal in ("BUY", "SELL"):
-        overrides.append(f"Confidence {confidence} below threshold 65")
+    threshold_used      = state.get("threshold_used", 65)
+    effective_threshold = max(threshold_used, 52)
+    if confidence < effective_threshold and signal in ("BUY", "SELL"):
+        overrides.append(
+            f"Confidence {confidence} below effective threshold {effective_threshold}"
+        )
         signal = "HOLD"
-        print(f"🛑 [Validator] HOLD override: Confidence {confidence} below threshold 65")
+        print(
+            f"🛑 [Validator] Rule 8: conf {confidence} "
+            f"< threshold {effective_threshold} → HOLD"
+        )
 
     validator_passed = len(overrides) == 0
     if validator_passed and signal in ("BUY", "SELL"):

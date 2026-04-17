@@ -238,6 +238,27 @@ def _audit_snapshot(state: dict) -> dict:
         "model_confidence": state.get("model_confidence"),
         "threshold_used": state.get("threshold_used"),
         "decision_delta": state.get("decision_delta"),
+        # Fields added to capture validator, aggregator, and catalyst data
+        "final_signal": state.get("final_signal"),
+        "validator_passed": state.get("validator_passed"),
+        "validator_overrides": copy.deepcopy(state.get("validator_overrides")),
+        "agreement_score": state.get("agreement_score"),
+        "consensus": state.get("consensus"),
+        "skip_claude": state.get("skip_claude"),
+        "skip_reason": state.get("skip_reason"),
+        "stoch_rsi_signal": state.get("stoch_rsi_signal"),
+        "stoch_rsi": state.get("stoch_rsi"),
+        "major_catalyst": state.get("major_catalyst"),
+        "pre_identified": state.get("pre_identified"),
+        "pre_identified_reason": state.get("pre_identified_reason"),
+        "has_edgar_filing": state.get("has_edgar_filing"),
+        "edgar_filing_type": state.get("edgar_filing_type"),
+        "signal_count_bull": state.get("signal_count_bull"),
+        "signal_count_bear": state.get("signal_count_bear"),
+        "bullish_signals": copy.deepcopy(state.get("bullish_signals")),
+        "bearish_signals": copy.deepcopy(state.get("bearish_signals")),
+        "market_regime": state.get("market_regime"),
+        "circuit_breaker_active": state.get("circuit_breaker_active"),
     }
 
 

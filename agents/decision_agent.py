@@ -100,7 +100,8 @@ def decision_node(state: dict) -> dict:
         }
 
     # ── Portfolio context ────────────────────────────────────────────────────
-    portfolio = hub.get_portfolio_context(ticker)
+    paper_mode = state.get("paper_trading", False)
+    portfolio  = hub.get_portfolio_context(ticker, paper=paper_mode)
     if portfolio.get("already_open"):
         print(f"⚠️  [DecisionAgent] {ticker} already in portfolio — will cap confidence")
 
@@ -165,10 +166,6 @@ def decision_node(state: dict) -> dict:
                 f"confidence={confidence}/100  det_score={det_score}  "
                 f"alert={'YES' if should_alert else 'NO'}"
             )
-
-        # ── Mark alerted for dedup (before returning) ─────────────────────────
-        if should_alert and signal in ("BUY", "SELL"):
-            hub.mark_alerted(ticker, signal)
 
         import performance_tracker as pt
         audit_state = {

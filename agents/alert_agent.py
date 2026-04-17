@@ -150,6 +150,9 @@ def alert_node(state: dict) -> dict:
             print("✅ [AlertAgent] Delivered via WhatsApp + Push")
             pt.mark_alert_fired(ticker, signal, paper=paper_trading)
             pt.record_signal(state)
+            from intelligence_hub import hub
+            hub.mark_alerted(ticker, signal)
+            print(f"✅ [Hub] {ticker} marked as alerted post-delivery")
             reason_code = "sent"
         else:
             print("⚠️  [AlertAgent] Delivery failed (check Twilio/Pushover config)")

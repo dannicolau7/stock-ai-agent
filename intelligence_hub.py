@@ -193,13 +193,17 @@ class IntelligenceHub:
 
     # ── Portfolio context ───────────────────────────────────────────────────────
 
-    def get_portfolio_context(self, ticker: str) -> dict:
+    def get_portfolio_context(self, ticker: str, paper: bool = False) -> dict:
         """
         Returns portfolio context for a ticker:
           - already_open: bool (ticker already has an open position)
           - open_count: int
           - open_tickers: list[str]
+        Paper mode always returns empty context to prevent contamination with live positions.
         """
+        _default = {"already_open": False, "open_count": 0, "open_tickers": []}
+        if paper:
+            return _default
         try:
             import performance_tracker as pt
             open_signals = pt.get_open_signals(paper=False)
@@ -211,7 +215,7 @@ class IntelligenceHub:
                 "open_tickers": tickers_open,
             }
         except Exception:
-            return {"already_open": False, "open_count": 0, "open_tickers": []}
+            return _default
 
     # ── Tomorrow watchlist ──────────────────────────────────────────────────────
 

@@ -49,8 +49,8 @@ def _fetch_spy_chg() -> float:
         df = yf.download("SPY", period="2d", interval="1d",
                          progress=False, auto_adjust=True)
         if df is not None and len(df) >= 2:
-            prev  = float(df["Close"].iloc[-2])
-            last  = float(df["Close"].iloc[-1])
+            prev  = float(df["Close"].iloc[-2].item())
+            last  = float(df["Close"].iloc[-1].item())
             if prev > 0:
                 return round((last / prev - 1) * 100, 2)
     except Exception:

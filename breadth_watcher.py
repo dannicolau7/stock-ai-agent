@@ -117,14 +117,14 @@ def _fetch_breadth_data() -> dict:
 
     # IWM vs SPY (small vs large — risk appetite)
     iwm_c = get_closes("IWM")
-    if len(spy_c) >= 2 and len(iwm_c) >= 2:
+    if len(spy_c) >= 20 and len(iwm_c) >= 20:
         spy_ret = (float(spy_c.iloc[-1]) - float(spy_c.iloc[-20])) / float(spy_c.iloc[-20]) * 100
         iwm_ret = (float(iwm_c.iloc[-1]) - float(iwm_c.iloc[-20])) / float(iwm_c.iloc[-20]) * 100
         result["small_vs_large_20d"] = round(iwm_ret - spy_ret, 2)  # positive = risk-on
 
     # RSP vs SPY (equal-weight vs cap-weight = breadth proxy)
     rsp_c = get_closes("RSP")
-    if len(rsp_c) >= 2 and len(spy_c) >= 2:
+    if len(rsp_c) >= 20 and len(spy_c) >= 20:
         rsp_ret = (float(rsp_c.iloc[-1]) - float(rsp_c.iloc[-20])) / float(rsp_c.iloc[-20]) * 100
         spy_ret_20 = (float(spy_c.iloc[-1]) - float(spy_c.iloc[-20])) / float(spy_c.iloc[-20]) * 100
         result["equal_vs_cap_20d"] = round(rsp_ret - spy_ret_20, 2)  # positive = broad participation

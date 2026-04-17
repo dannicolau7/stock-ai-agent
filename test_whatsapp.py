@@ -2,24 +2,32 @@ from twilio.rest import Client
 import os
 from dotenv import load_dotenv
 
-load_dotenv()
 
-account_sid = os.getenv('TWILIO_ACCOUNT_SID')
-auth_token = os.getenv('TWILIO_AUTH_TOKEN')
-to_number = 'whatsapp:+17635685097'
-from_number = 'whatsapp:+14155238886'
+def send_test_whatsapp() -> None:
+    load_dotenv()
 
-print(f'Account SID: {account_sid[:10]}...')
-print(f'Sending WhatsApp to: {to_number}')
+    account_sid = os.getenv("TWILIO_ACCOUNT_SID")
+    auth_token = os.getenv("TWILIO_AUTH_TOKEN")
+    to_number = "whatsapp:+17635685097"
+    from_number = "whatsapp:+14155238886"
 
-client = Client(account_sid, auth_token)
+    if not all([account_sid, auth_token]):
+        raise RuntimeError("Missing Twilio WhatsApp environment variables")
 
-message = client.messages.create(
-    body='Argus - WhatsApp Test! BUY BZAI $1.79 Zone: $1.75-$1.82 Target: $2.10 Stop: $1.65 Confidence: 72%',
-    from_=from_number,
-    to=to_number
-)
+    print(f"Account SID: {account_sid[:10]}...")
+    print(f"Sending WhatsApp to: {to_number}")
 
-print(f'Status: {message.status}')
-print(f'SID: {message.sid}')
-print('Check your WhatsApp!')
+    client = Client(account_sid, auth_token)
+    message = client.messages.create(
+        body="Argus - WhatsApp Test! BUY BZAI $1.79 Zone: $1.75-$1.82 Target: $2.10 Stop: $1.65 Confidence: 72%",
+        from_=from_number,
+        to=to_number,
+    )
+
+    print(f"Status: {message.status}")
+    print(f"SID: {message.sid}")
+    print("Check your WhatsApp!")
+
+
+if __name__ == "__main__":
+    send_test_whatsapp()

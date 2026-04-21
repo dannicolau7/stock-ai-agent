@@ -35,6 +35,22 @@ import world_context as wctx
 DISCOVERY_INTERVAL = 4 * 60 * 60   # 4 hours
 LOG_PATH = Path(__file__).parent / "data" / "discovery_log.jsonl"
 
+# Theme → curated liquid tickers for each catalyst sub-sector
+CATALYST_THEME_UNIVERSE: dict[str, list[str]] = {
+    "quantum_computing":  ["IONQ", "RGTI", "QBTS", "XNDU", "QUBT", "ARQQ", "IBM"],
+    "ai_infrastructure":  ["NVDA", "AMD", "SMCI", "PLTR", "ARM", "INTC", "DELL"],
+    "biotech_fda":        ["MRNA", "BNTX", "NVAX", "RCKT", "IOVA", "ACAD", "FOLD"],
+    "ev_automotive":      ["TSLA", "RIVN", "LCID", "NIO", "FSR", "XPEV", "LI"],
+    "crypto_blockchain":  ["COIN", "MSTR", "MARA", "RIOT", "CLSK", "HUT", "BTBT"],
+    "energy_oil":         ["XOM", "CVX", "OXY", "SLB", "HAL", "FANG", "MPC"],
+    "defense_aerospace":  ["LMT", "RTX", "BA", "NOC", "GD", "AXON", "RKLB"],
+    "semiconductors":     ["NVDA", "AMD", "INTC", "QCOM", "AVGO", "MU", "AMAT"],
+    "clean_energy":       ["ENPH", "SEDG", "FSLR", "PLUG", "BE", "BLDP", "RUN"],
+    "fintech":            ["SQ", "PYPL", "AFRM", "UPST", "SOFI", "NU", "DAVE"],
+    "space":              ["RKLB", "JOBY", "ACHR", "ASTS", "LUNR", "RDW"],
+    "cybersecurity":      ["CRWD", "PANW", "ZS", "S", "FTNT", "QLYS", "TENB"],
+}
+
 # Sector → representative liquid tickers to screen
 SECTOR_UNIVERSE = {
     "XLK":  ["AAPL", "MSFT", "NVDA", "AMD", "INTC", "QCOM", "AVGO", "CRM", "ORCL", "META"],
@@ -60,6 +76,28 @@ def _get_client() -> anthropic.Anthropic:
     return _client
 
 
+# ── Catalyst helpers ──────────────────────────────────────────────────────────
+
+def _get_catalyst_tickers() -> list[str]:
+    """Return deduplicated tickers for all active BULLISH sector catalysts (score >= 6)."""
+    geo = wctx.get().get("geo", {})
+    catalysts = [
+        c for c in geo.get("sector_catalysts", [])
+        if c.get("score", 0) >= 6 and c.get("direction") == "BULLISH"
+    ]
+    tickers: list[str] = []
+    for cat in catalysts:
+        tickers += cat.get("tickers", [])
+        tickers += CATALYST_THEME_UNIVERSE.get(cat.get("theme", ""), [])
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in tickers:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
 # ── Step 1: Ask Claude which sectors to focus on ──────────────────────────────
 
 def _ask_claude_for_sectors(ctx: dict) -> dict:
@@ -71,11 +109,15 @@ def _ask_claude_for_sectors(ctx: dict) -> dict:
 
     world_section = wctx.build_prompt_section()
 
+    catalyst_tickers = _get_catalyst_tickers()
+    catalyst_note = ""
+    if catalyst_tickers:
+        catalyst_note = f"\nACTIVE SECTOR CATALYSTS: {', '.join(catalyst_tickers[:12])} — prioritize these.\n"
+
     prompt = f"""You are a portfolio manager choosing which sectors and stocks to scan for trading opportunities TODAY.
 
 CURRENT ENVIRONMENT:
-{world_section}
-
+{world_section}{catalyst_note}
 Available sector ETFs to choose from:
 XLK (Tech), XLF (Financials), XLE (Energy), XLV (Healthcare), XLY (Consumer Disc),
 XLP (Consumer Staples), XLI (Industrials), XLB (Materials), XLC (Communication),
@@ -288,9 +330,17 @@ def _run_sweep(static_watchlist: list[str] | None = None) -> bool:
 
 
 def get_discovery_tickers() -> list[str]:
-    """Returns the current discovery candidate list (used by monitoring loop)."""
+    """Returns catalyst tickers (prepended) + discovery candidates, deduplicated."""
     ctx = wctx.get()
-    return ctx.get("social", {}).get("discovery_candidates", [])
+    catalyst_tickers      = _get_catalyst_tickers()
+    discovery_candidates  = ctx.get("social", {}).get("discovery_candidates", [])
+    seen: set[str] = set()
+    out: list[str] = []
+    for t in catalyst_tickers + discovery_candidates:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
 
 
 # ── Main loop ─────────────────────────────────────────────────────────────────

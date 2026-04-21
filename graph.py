@@ -12,6 +12,7 @@ from typing import TypedDict
 import copy
 
 from langgraph.graph import StateGraph, END
+from langsmith import traceable
 
 import concurrent.futures
 
@@ -43,6 +44,7 @@ _TECH_KEYS = frozenset({
 })
 
 
+@traceable(name="parallel_analyze", tags=["pipeline", "parallel"])
 def parallel_analyze_node(state: dict) -> dict:
     """Runs news_node and tech_node concurrently, then merges their outputs."""
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as exe:

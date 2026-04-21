@@ -6,6 +6,9 @@ from datetime import datetime, timezone
 import yfinance as yf
 from polygon_feed import get_daily_bars, get_current_price, get_news, get_previous_close, get_ticker_details
 
+from langsmith import traceable
+from utils.tracing import annotate_run
+
 
 def _fetch_intraday_bars(ticker: str) -> list:
     """Fetch today's 15-min intraday bars via yfinance."""
@@ -153,8 +156,10 @@ def _fetch_sector(ticker: str) -> str:
         return "Technology"
 
 
+@traceable(name="data_agent", tags=["pipeline", "data"])
 def run_data_agent(state: dict) -> dict:
     ticker = state.get("ticker", "")
+    annotate_run(state)
     print(f"📡 [DataAgent] Fetching data for {ticker}...")
 
     try:

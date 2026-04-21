@@ -17,6 +17,8 @@ from datetime import datetime, timezone
 
 import anthropic
 from config import ANTHROPIC_API_KEY
+from langsmith import traceable
+from utils.tracing import annotate_run
 
 # ── Per-source TTL caches ──────────────────────────────────────────────────────
 # Avoids re-hitting the same external API on every scan cycle for the same ticker.
@@ -244,8 +246,10 @@ def _claude_sentiment(ticker: str, headlines: list) -> tuple:
 
 # ── LangGraph node ─────────────────────────────────────────────────────────────
 
+@traceable(name="news_agent", tags=["pipeline", "news", "llm"])
 def news_node(state: dict) -> dict:
     ticker   = state["ticker"]
+    annotate_run(state)
     raw_news = state.get("raw_news", [])
 
     print(f"📰 [NewsAgent] Analyzing sentiment for {ticker}...")

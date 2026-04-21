@@ -10,6 +10,8 @@ from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 import yfinance as yf
+from langsmith import traceable
+from utils.tracing import annotate_run
 
 EST = ZoneInfo("America/New_York")
 
@@ -195,6 +197,71 @@ def _ema_stack(closes: np.ndarray) -> dict:
         "ema9":  round(ema9,  4),
         "ema21": round(ema21, 4),
         "ema50": round(ema50, 4),
+    }
+
+
+def _fetch_hourly_bars(ticker: str) -> list[dict]:
+    """
+    Fetch last 5 days of 1-hour bars via yfinance.
+    Returns list of {"o","h","l","c","v"} dicts, or [] on failure.
+    """
+    try:
+        df = yf.Ticker(ticker).history(period="5d", interval="1h")
+        if df.empty:
+            return []
+        bars = []
+        for ts, row in df.iterrows():
+            bars.append({
+                "o": float(row["Open"]),
+                "h": float(row["High"]),
+                "l": float(row["Low"]),
+                "c": float(row["Close"]),
+                "v": float(row["Volume"]),
+            })
+        return bars
+    except Exception:
+        return []
+
+
+def _timeframe_signal(closes: np.ndarray, label: str) -> dict:
+    """
+    Summarise one timeframe as BULLISH / BEARISH / NEUTRAL.
+
+    Criteria — BULLISH (all 3 must hold):
+      • MACD histogram > 0
+      • RSI ≤ 70  (not overbought)
+      • Price > MA20 (short-term uptrend)
+
+    Criteria — BEARISH (all 3 must hold):
+      • MACD histogram < 0
+      • RSI ≥ 30  (not oversold)
+      • Price < MA20
+
+    Anything else → NEUTRAL.
+    """
+    if len(closes) < 5:
+        return {"rsi": 50.0, "macd_hist": 0.0, "ma20": 0.0, "signal": "NEUTRAL", "tf": label}
+
+    rsi       = _calc_rsi(closes)
+    macd_d    = _calc_macd(closes)
+    hist      = macd_d["histogram"]
+    ma20      = float(np.mean(closes[-min(20, len(closes)):])) if len(closes) >= 2 else float(closes[-1])
+    price     = float(closes[-1])
+
+    if hist > 0 and rsi <= 70 and price > ma20:
+        sig = "BULLISH"
+    elif hist < 0 and rsi >= 30 and price < ma20:
+        sig = "BEARISH"
+    else:
+        sig = "NEUTRAL"
+
+    return {
+        "rsi":       round(rsi, 1),
+        "macd_hist": round(hist, 6),
+        "ma20":      round(ma20, 4),
+        "price":     round(price, 4),
+        "signal":    sig,
+        "tf":        label,
     }
 
 
@@ -460,7 +527,9 @@ def _find_sr(bars: list, lookback: int = 20) -> dict:
 
 # ── LangGraph node ─────────────────────────────────────────────────────────────
 
+@traceable(name="tech_agent", tags=["pipeline", "indicators"])
 def tech_node(state: dict) -> dict:
+    annotate_run(state)
     bars              = state.get("bars", [])
     intraday_bars     = state.get("intraday_bars", [])
     ticker            = state["ticker"]
@@ -574,6 +643,50 @@ def tech_node(state: dict) -> dict:
             pat_names = ", ".join(p["pattern"] for p in patterns)
             print(f"   🔷 Patterns: {pat_names}")
 
+        # ── 3-Timeframe agreement ─────────────────────────────────────────────
+        # Daily (existing closes), Hourly (fresh fetch), 15-min (intraday_bars)
+        tf_daily    = _timeframe_signal(closes, "daily")
+        hourly_bars = _fetch_hourly_bars(ticker)
+        if hourly_bars:
+            h_closes  = _sanitize(np.array([float(b["c"]) for b in hourly_bars], dtype=float))
+            tf_hourly = _timeframe_signal(h_closes, "1h")
+        else:
+            tf_hourly = {"rsi": 50.0, "macd_hist": 0.0, "ma20": 0.0, "price": 0.0,
+                         "signal": "NEUTRAL", "tf": "1h"}
+
+        if intraday_bars:
+            i_closes   = _sanitize(np.array([float(b["c"]) for b in intraday_bars], dtype=float))
+            tf_intraday = _timeframe_signal(i_closes, "15m")
+        else:
+            tf_intraday = {"rsi": 50.0, "macd_hist": 0.0, "ma20": 0.0, "price": 0.0,
+                           "signal": "NEUTRAL", "tf": "15m"}
+
+        sigs           = [tf_daily["signal"], tf_hourly["signal"], tf_intraday["signal"]]
+        buy_confirmed  = all(s == "BULLISH" for s in sigs)
+        sell_confirmed = all(s == "BEARISH" for s in sigs)
+        if buy_confirmed:
+            tf_agreement = "ALL_BULL"
+        elif sell_confirmed:
+            tf_agreement = "ALL_BEAR"
+        else:
+            tf_agreement = "MIXED"
+
+        print(
+            f"   3TF: daily={tf_daily['signal']} "
+            f"1h={tf_hourly['signal']} "
+            f"15m={tf_intraday['signal']} "
+            f"→ {tf_agreement}"
+        )
+
+        timeframe_agreement = {
+            "daily":          tf_daily,
+            "hourly":         tf_hourly,
+            "intraday":       tf_intraday,
+            "agreement":      tf_agreement,
+            "buy_confirmed":  buy_confirmed,
+            "sell_confirmed": sell_confirmed,
+        }
+
         # ── Pre-compute score breakdown (for transparency) ────────────────────
         from self_learner import get_weight_adjustments
         partial_state = {
@@ -630,6 +743,7 @@ def tech_node(state: dict) -> dict:
             "relative_strength":  rel_str,
             "score_breakdown":    score_bd,
             "patterns":           patterns,
+            "timeframe_agreement": timeframe_agreement,
         }
 
     except Exception as e:
@@ -664,6 +778,9 @@ def tech_node(state: dict) -> dict:
             "score_breakdown":    {"raw_score": 0, "final_score": 0, "timing_mult": 1.0,
                                    "fired": [], "missed": []},
             "patterns":           [],
+            "timeframe_agreement": {"daily": {}, "hourly": {}, "intraday": {},
+                                    "agreement": "MIXED",
+                                    "buy_confirmed": False, "sell_confirmed": False},
         }
 
 run_tech_agent = tech_node

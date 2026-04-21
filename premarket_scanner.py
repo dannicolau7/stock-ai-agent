@@ -44,15 +44,84 @@ PREP_LIST = os.path.join(_DIR, "data", "prep_alert_list.json")
 TODAY_WL  = os.path.join(_DIR, "data", "todays_watchlist.json")
 
 # ── Thresholds ─────────────────────────────────────────────────────────────────
-MIN_GAP_PCT       = 2.0       # % gap to qualify
-MIN_PREMARKET_VOL = 30_000    # share volume
-MIN_PRICE         = 0.50
-MAX_PRICE         = 150.0
-MAX_WORKERS       = 12
-SCORE_BUY         = 60        # min score for BUY_AT_OPEN alert
-SCORE_WATCH       = 40        # min score for WATCH alert
+MIN_GAP_PCT         = 2.0       # % gap to qualify
+MIN_PREMARKET_VOL   = 30_000    # share volume
+MIN_PRICE           = 0.50
+MAX_PRICE           = 150.0
+MAX_WORKERS         = 12
+SCORE_BUY           = 60        # min score for BUY_AT_OPEN alert
+SCORE_WATCH         = 40        # min score for WATCH alert
+MIN_RVOL            = 1.5       # relative volume floor — below this = hard block
+HIGH_RVOL_EXCEPTION = 3.0       # if RVOL > this AND news catalyst, allow regardless
 
-_SEP = "─" * 30
+_SEP         = "─" * 30
+_BLOCKED_LOG = os.path.join(_DIR, "data", "blocked_signals.csv")
+
+
+# ── Volume filter helpers ──────────────────────────────────────────────────────
+
+def _compute_rvol(premarket_vol: int, avg_daily_vol: float) -> float:
+    """
+    Relative volume vs expected pre-market baseline.
+    Normalises against avg_daily / 6.5 (one hour of typical trading).
+    Returns 0.0 when avg volume is unavailable.
+    """
+    if avg_daily_vol <= 0:
+        return 0.0
+    return premarket_vol / (avg_daily_vol / 6.5)
+
+
+def _has_news_catalyst(c: Dict) -> bool:
+    return bool(
+        c.get("news_headline")
+        or c.get("has_edgar")
+        or c.get("is_upgrade")
+        or c.get("is_earnings_beat")
+        or c.get("is_contract")
+    )
+
+
+def _passes_rvol_filter(c: Dict) -> bool:
+    """True if candidate should proceed to Claude analysis."""
+    rvol = c.get("rvol", 0.0)
+    if rvol == 0.0:
+        return True   # unknown — can't filter, let it through
+    if rvol >= MIN_RVOL:
+        return True
+    if rvol > HIGH_RVOL_EXCEPTION and _has_news_catalyst(c):
+        return True   # unusual volume IS the signal
+    return False
+
+
+_BLOCKED_LOG_FIELDS = [
+    "ts", "ticker", "date_blocked", "earnings_date",
+    "days_until_earnings", "original_signal", "rvol", "reason", "source",
+]
+
+
+def _log_blocked(ticker: str, rvol: float, reason: str) -> None:
+    """Append a volume-blocked row to data/blocked_signals.csv."""
+    import csv
+    try:
+        os.makedirs(os.path.dirname(_BLOCKED_LOG), exist_ok=True)
+        write_header = not os.path.exists(_BLOCKED_LOG)
+        with open(_BLOCKED_LOG, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_BLOCKED_LOG_FIELDS, extrasaction="ignore")
+            if write_header:
+                writer.writeheader()
+            writer.writerow({
+                "ts":                  datetime.now().isoformat(),
+                "ticker":              ticker,
+                "date_blocked":        datetime.now().date().isoformat(),
+                "earnings_date":       "",
+                "days_until_earnings": "",
+                "original_signal":     "",
+                "rvol":                round(rvol, 2),
+                "reason":              reason,
+                "source":              "premarket_scanner",
+            })
+    except Exception as e:
+        print(f"⚠️  [PremarketScanner] blocked_signals log failed: {e}")
 
 
 # ── Step 2 — Fetch pre-market data ─────────────────────────────────────────────
@@ -110,6 +179,7 @@ def get_premarket_data(ticker: str) -> Optional[Dict]:
             "prev_close":      round(prev_close, 4),
             "premarket_vol":   premarket_vol,
             "avg_vol":         int(avg_vol),
+            "rvol":            round(_compute_rvol(premarket_vol, avg_vol), 2),
             # Enrichment fields (filled later)
             "news_headline":    "",
             "has_edgar":        False,
@@ -528,13 +598,60 @@ def run_premarket_scan(
         c["score"] = _score_candidate(c)
 
     enriched.sort(key=lambda x: x["score"], reverse=True)
-    top10 = enriched[:10]
+
+    # Step 3b — RVOL hard filter (before Claude to save API calls)
+    vol_passed: List[Dict] = []
+    for c in enriched:
+        if _passes_rvol_filter(c):
+            vol_passed.append(c)
+        else:
+            rvol   = c.get("rvol", 0.0)
+            reason = f"Low volume {rvol:.1f}x"
+            _log_blocked(c["ticker"], rvol, reason)
+            print(f"⛔ [PremarketScanner] {c['ticker']} blocked — {reason}")
+
+    if not vol_passed:
+        print(f"💤 [PremarketScanner] All candidates blocked by RVOL filter.")
+        return []
+
+    blocked_count = len(enriched) - len(vol_passed)
+    if blocked_count:
+        print(f"   Step 3b: {blocked_count} candidate(s) removed by RVOL < {MIN_RVOL}x filter")
+
+    # Step 3c — Earnings blackout filter
+    from utils.earnings_gate import check_earnings_blackout, log_earnings_block
+    earnings_passed: List[Dict] = []
+    for c in vol_passed:
+        eb = check_earnings_blackout(c["ticker"])
+        if eb["blocked"]:
+            log_earnings_block(
+                ticker=c["ticker"],
+                original_signal="premarket_scan",
+                days_until=eb["days_until"],
+                earnings_date=eb["earnings_date"],
+                source="premarket_scanner",
+            )
+            print(f"📅 [PremarketScanner] {c['ticker']} blocked — earnings in {eb['days_until']}d ({eb['earnings_date']})")
+        else:
+            earnings_passed.append(c)
+            if eb["warning"]:   # no earnings data — log as info, don't block
+                print(f"   ℹ️  {c['ticker']}: {eb['warning']}")
+
+    earn_blocked = len(vol_passed) - len(earnings_passed)
+    if earn_blocked:
+        print(f"   Step 3c: {earn_blocked} candidate(s) removed by earnings blackout filter")
+
+    if not earnings_passed:
+        print(f"💤 [PremarketScanner] All candidates blocked by earnings blackout.")
+        return []
+
+    top10 = earnings_passed[:10]
 
     if verbose:
         print(f"\n   Top candidates before Claude:")
         for c in top10:
             print(f"     {c['ticker']:8s}  gap={c['gap_pct']:+.1f}%  "
-                  f"vol={c['premarket_vol'] / 1_000:.0f}k  "
+                  f"vol={c['premarket_vol'] / 1_000:.0f}k  rvol={c.get('rvol', 0):.1f}x  "
                   f"score={c['score']}  news={bool(c.get('news_headline'))}")
 
     # Step 4 — Claude analysis

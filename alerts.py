@@ -116,6 +116,10 @@ def send_alert(ticker: str, signal: str, price: float,
                catalyst_str: str = "",
                main_risk: str = "",
                det_score: int = 0,
+               bull_score: int = 0,
+               bear_score: int = 0,
+               bull_summary: str = "",
+               bear_summary: str = "",
                ) -> bool:
     """
     Send a trade alert via WhatsApp, Pushover, and email.
@@ -191,6 +195,17 @@ def send_alert(ticker: str, signal: str, price: float,
                 (f'\n{conflict_sig}' if conflict_sig else '')
             )
 
+        # ── Bull vs Bear debate section ────────────────────────────────────────
+        debate_section = ""
+        if bull_score or bear_score:
+            net = bull_score - bear_score
+            debate_section = (
+                f'{_SEP}\n'
+                f'🟢 Bull ({bull_score}): {bull_summary[:80]}\n'
+                f'🔴 Bear ({bear_score}): {bear_summary[:80]}\n'
+                f'Decision: {signal} (net {net:+d})\n'
+            )
+
         message = (
             f'{emoji} {ticker} ${price:.2f}\n'
             f'{score_line}\n'
@@ -199,12 +214,11 @@ def send_alert(ticker: str, signal: str, price: float,
             f'TARGET: {targets_line}\n'
             f'STOP:   ${stop:.2f} ({stop_pct:.1f}%)\n'
             f'{sig_section}\n'
+            f'{debate_section}'
             f'{_SEP}\n'
             f'Market: {market_regime_str or "—"}  Sector: {sector_str or "—"}\n'
             f'Catalyst: {catalyst_str or "No recent news"}\n'
             f'Horizon: {horizon_label}\n'
-            f'{_SEP}\n'
-            f'{reason[:240]}\n'
         )
         if main_risk:
             message += f'Risk: {main_risk[:120]}'

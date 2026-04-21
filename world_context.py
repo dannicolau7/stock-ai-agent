@@ -20,12 +20,13 @@ _SAVE_PATH = Path("data/world_context.json")
 
 _CTX_DEFAULT: dict = {
     "geo": {
-        "events":       [],       # [{headline, sectors, direction, magnitude, impact}]
-        "overall_bias": "NEUTRAL",
-        "hot_sectors":  [],       # sectors to favor
-        "cold_sectors": [],       # sectors to avoid
-        "risk_summary": "",
-        "updated_at":   None,
+        "events":           [],       # [{headline, sectors, direction, magnitude, impact}]
+        "overall_bias":     "NEUTRAL",
+        "hot_sectors":      [],       # sectors to favor
+        "cold_sectors":     [],       # sectors to avoid
+        "risk_summary":     "",
+        "sector_catalysts": [],       # [{theme, display_name, tickers, score, direction, headline}]
+        "updated_at":       None,
     },
     "macro": {
         "regime":       "UNKNOWN",   # BULL / BEAR / STAGFLATION / RECOVERY / NEUTRAL

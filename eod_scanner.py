@@ -606,14 +606,17 @@ def _setup_to_record(c: Dict) -> Dict:
 
 def _build_universe(size: int = 200) -> List[str]:
     import watchlist_manager as wl
-    watchlist = wl.load()
-    universe: list = []
+    import world_context as _wctx
+    from discovery_agent import _get_catalyst_tickers
+    watchlist        = wl.load()
+    catalyst_tickers = _get_catalyst_tickers()
+    universe: list   = []
     try:
         from market_scanner import _load_universe
         universe = _load_universe() or []
     except Exception:
         pass
-    return list(dict.fromkeys(watchlist + universe[:size]))
+    return list(dict.fromkeys(catalyst_tickers + watchlist + universe[:size]))
 
 
 # ── EDGAR helpers ──────────────────────────────────────────────────────────────
@@ -764,6 +767,15 @@ def run_preclose_scan(test: bool = False, verbose: bool = False) -> List[Dict]:
         for s, r in sorted(sector_rets.items(), key=lambda x: -abs(x[1]))[:5]:
             print(f"     {s}: {r:+.1f}%")
 
+    # Check for active sector catalysts — lower threshold on catalyst days
+    import world_context as _wctx
+    _geo             = _wctx.get().get("geo", {})
+    _active_catalysts = [c for c in _geo.get("sector_catalysts", []) if c.get("score", 0) >= 7]
+    _effective_threshold = 45 if _active_catalysts else SCORE_THRESHOLD
+    if _active_catalysts:
+        print(f"⚡ [EOD] Catalyst day — threshold lowered to {_effective_threshold} "
+              f"({len(_active_catalysts)} active catalyst(s))")
+
     tickers = _build_universe(size=200)
     print(f"   Scanning {len(tickers)} tickers in parallel...")
 
@@ -783,11 +795,11 @@ def run_preclose_scan(test: bool = False, verbose: bool = False) -> List[Dict]:
         d["patterns"] = patterns
 
     candidates = sorted(
-        [d for d in raw if d["score"] >= SCORE_THRESHOLD and d["patterns"]],
+        [d for d in raw if d["score"] >= _effective_threshold and d["patterns"]],
         key=lambda x: x["score"], reverse=True,
     )[:MAX_SETUPS]
 
-    print(f"   {len(candidates)} candidates scored >= {SCORE_THRESHOLD}")
+    print(f"   {len(candidates)} candidates scored >= {_effective_threshold}")
     if verbose:
         for c in candidates:
             print(f"     {c['ticker']:8s}  score={c['score']}  patterns={c['patterns']}  "

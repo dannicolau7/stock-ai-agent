@@ -917,6 +917,51 @@ async def api_alerts():
     }))
 
 
+# ── Weekly eval approval endpoints ────────────────────────────────────────────
+
+@app.get("/api/eval/status")
+async def api_eval_status():
+    """Return current weekly eval proposal (pending / approved / rejected)."""
+    try:
+        from agents.eval_agent import get_pending_approval, _load_weekly
+        data    = _load_weekly()
+        pending = get_pending_approval()
+        history = data.get("history", [])
+        return {
+            "pending":            pending,
+            "history_count":      len(history),
+            "last_3_weeks":       history[-3:] if history else [],
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/eval/approve/{code}")
+async def api_eval_approve(code: str):
+    """Approve the pending weekly eval proposal and apply weight adjustments."""
+    try:
+        from agents.eval_agent import approve_learnings
+        result = approve_learnings(code.upper())
+        if result.get("ok"):
+            return {"status": "approved", "weights_applied": len(result.get("applied", {}))}
+        return {"status": "error", "reason": result.get("reason", "unknown")}
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+
+@app.get("/api/eval/reject/{code}")
+async def api_eval_reject(code: str):
+    """Reject the pending weekly eval proposal without applying changes."""
+    try:
+        from agents.eval_agent import reject_learnings
+        result = reject_learnings(code.upper())
+        if result.get("ok"):
+            return {"status": "rejected"}
+        return {"status": "error", "reason": result.get("reason", "unknown")}
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
+
+
 # ── Backtest endpoint ──────────────────────────────────────────────────────────
 
 @app.post("/api/backtest")

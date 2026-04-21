@@ -161,6 +161,11 @@ class TestDecisionHubInteraction:
             "horizon_reasoning": "",
             "main_risk": "",
             "top_3_signals": [],
+            "bull_score": 70,
+            "bear_score": 35,
+            "net_score": 35,
+            "bull_summary": "Strong momentum with volume catalyst",
+            "bear_summary": "Minor overhead resistance near target",
         })
 
         import performance_tracker as pt

@@ -188,6 +188,18 @@ def _check_positions() -> list[dict]:
         exit_price  = current
 
         # Check exit conditions (in priority order)
+        # 0. Earnings proximity — force-close EXIT_DAYS before earnings
+        try:
+            from utils.earnings_gate import check_earnings_blackout, EXIT_DAYS
+            _eb = check_earnings_blackout(ticker)
+            if _eb["days_until"] <= EXIT_DAYS:
+                exit_reason = (
+                    f"Earnings in {_eb['days_until']}d ({_eb['earnings_date']}) "
+                    f"— forced exit before event risk"
+                )
+        except Exception:
+            pass
+
         if stop > 0 and current <= stop:
             exit_reason = f"Stop-loss hit (${stop:.2f})"
         elif t2 and current >= t2 and not pos["t2_hit"]:

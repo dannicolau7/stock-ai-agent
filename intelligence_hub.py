@@ -200,16 +200,23 @@ class IntelligenceHub:
           - open_count: int
           - open_tickers: list[str]
         """
-        _default = {"already_open": False, "open_count": 0, "open_tickers": []}
+        _default = {"already_open": False, "open_count": 0, "open_tickers": [], "entry_price": 0.0}
         try:
             import performance_tracker as pt
             open_signals = pt.get_open_signals()
             tickers_open = [s.get("ticker", "") for s in open_signals]
             already_open = ticker in tickers_open
+            entry_price  = 0.0
+            if already_open:
+                for s in open_signals:
+                    if s.get("ticker") == ticker:
+                        entry_price = float(s.get("price", 0.0))
+                        break
             return {
                 "already_open": already_open,
                 "open_count":   len(open_signals),
                 "open_tickers": tickers_open,
+                "entry_price":  entry_price,
             }
         except Exception:
             return _default

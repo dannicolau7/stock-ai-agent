@@ -23,7 +23,7 @@ def test_pipeline_audit_real():
     missing = [f for f in critical_fields if f not in result]
 
     assert not missing, f"Pipeline missing fields: {missing}"
-    assert result["signal"] in ("BUY", "SELL", "HOLD")
+    assert result["signal"] in ("BUY", "SELL", "HOLD", "TAKE_PROFIT")
     assert result.get("stoch_rsi_signal") not in (None, "NONE", "")
     assert "validator_passed" in result
 

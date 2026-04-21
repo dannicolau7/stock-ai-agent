@@ -1,67 +1,91 @@
 """
-scheduler.py — Full-day trading schedule.
+scheduler.py — APScheduler-based trading schedule (America/New_York).
 
-  3:00 AM  Overnight news scan  (WhatsApp if score >= 85)
-  4:00 AM  Early gap check (watchlist, gap ≥ 5% → WhatsApp)
-  6:00 AM  Broader gap check (watchlist + universe[:50])
-  7:30 AM  Quick Claude pre-market scan (watchlist gappers)
-  7:45 AM  Best-of-Day selection (gate filter → score → Claude → WhatsApp)
-  8:00 AM  Morning digest (movers + macro + today's picks → WhatsApp)
-  8:30 AM  Pre-market gap scanner (dashboard cache update + WhatsApp)
-  8:45 AM  Broad pre-market Claude scan (save prep list)
-  9:10 AM  PREP alert (final scan → save prep_alert_list.json → WhatsApp)
-  9:25 AM  Confirmation check (STILL BUY / WEAKENED / STAND DOWN → WhatsApp)
-  9:30 AM  Live monitoring (handled by main.py's monitoring_loop)
-  3:30 PM  EOD pre-close scan (accumulation/bounce/coiling → tomorrow_watchlist.json)
-  4:00 PM  "Market closed" + after-hours summary
-  4:15 PM  EOD after-close (earnings + EDGAR 8-Ks → update tomorrow_watchlist.json)
-  4:30 PM  Daily performance report WhatsApp
-  6:00 PM  EOD evening scan (AH prices + Polygon news → finalize tomorrow_watchlist.json)
-  8:00 PM  EOD final overnight (last EDGAR + breaking news sweep)
- 10:00 PM  Final scan  (WhatsApp if score >= 85)
- 11:00 PM  Good night + graceful shutdown
+  7:45 AM  Mon–Fri   SCAN 1 — Pre-market TOP 5 (fresh catalysts only)
+  9:45 AM  Mon–Fri   SCAN 2 — Opening range: confirm gap holders → fire BUY alerts
+  2:00 PM  Mon–Fri   SCAN 3 — Power hour: intraday momentum → tomorrow's setups
+  :00,:30  Mon–Fri 9:30–16:00  Exit agent — monitor all open positions
+  4:15 PM  Mon–Fri   Daily P&L summary
+  Sun 7:00 PM ET      Weekly eval report
+
+Market status is validated via Polygon API (5-min cache) before each intraday scan,
+with a time-based fallback if Polygon is unavailable.
 """
 
 import asyncio
+import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
+from typing import Optional
 from zoneinfo import ZoneInfo
 
-import watchlist_manager as wl
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.cron import CronTrigger
+
 from alerts import send_whatsapp
 from graph import GRAPH, make_initial_state
 from intelligence_hub import hub
-from market_scanner import scan_best_of_day, scan_broad_market
 
-EST      = ZoneInfo("America/New_York")
-_executor = ThreadPoolExecutor(max_workers=2)
+EST = ZoneInfo("America/New_York")
+_executor = ThreadPoolExecutor(max_workers=4)
 
-# ── Fire-once-per-day guard ────────────────────────────────────────────────────
+# ── Module-level state ─────────────────────────────────────────────────────────
 
-_fired_today: dict = {}
-_sweep_results: list = []   # shared between 7:45 sweep and 8:00 digest
+# Populated by scheduler_loop(); read by job functions
+_daily_log:     list = []
+_signal_memory: dict = {}
 
+# Scan 1 results cached for Scan 2 to re-check
+_scan1_results: list = []
 
-def _today() -> str:
-    return datetime.now(tz=EST).strftime("%Y-%m-%d")
+# ── Market status check ────────────────────────────────────────────────────────
 
-
-def _should_fire(event: str) -> bool:
-    return _fired_today.get(event) != _today()
-
-
-def _mark_fired(event: str):
-    _fired_today[event] = _today()
+_market_status_cache: dict = {"open": False, "fetched_at": 0.0}
+_MARKET_STATUS_TTL = 300   # 5-minute cache
 
 
-def _in_window(hour: int, minute: int, window_min: int = 10) -> bool:
-    now    = datetime.now(tz=EST)
-    target = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
-    delta  = (now - target).total_seconds()
-    return 0 <= delta < (window_min * 60)
+def _is_market_open() -> bool:
+    """
+    Returns True if the US equities market is currently open.
+    Checks Polygon's /v1/marketstatus/now (5-min cache); falls back to time-based.
+    """
+    now_ts = time.monotonic()
+    if now_ts - _market_status_cache["fetched_at"] < _MARKET_STATUS_TTL:
+        return _market_status_cache["open"]
+
+    api_key = os.getenv("POLYGON_API_KEY", "")
+    is_open: Optional[bool] = None
+
+    if api_key:
+        try:
+            import requests
+            r = requests.get(
+                "https://api.polygon.io/v1/marketstatus/now",
+                params={"apiKey": api_key},
+                timeout=5,
+            )
+            if r.ok:
+                status = r.json().get("market", "closed")
+                is_open = status == "open"
+        except Exception as _e:
+            print(f"⚠️  [Scheduler] Polygon market status failed: {_e}")
+
+    if is_open is None:
+        # Time-based fallback
+        est = datetime.now(tz=EST)
+        if est.weekday() >= 5:
+            is_open = False
+        else:
+            open_t  = est.replace(hour=9,  minute=30, second=0, microsecond=0)
+            close_t = est.replace(hour=16, minute=0,  second=0, microsecond=0)
+            is_open = open_t <= est <= close_t
+
+    _market_status_cache.update({"open": is_open, "fetched_at": now_ts})
+    return is_open
 
 
-# ── Graph runner (off-hours) ───────────────────────────────────────────────────
+# ── Graph runner helpers ───────────────────────────────────────────────────────
 
 def _run_graph_sync(ticker: str) -> dict:
     return GRAPH.invoke(make_initial_state(ticker))
@@ -72,443 +96,544 @@ async def _run_ticker(ticker: str) -> dict:
     return await loop.run_in_executor(_executor, _run_graph_sync, ticker)
 
 
-# ── Scheduled events ──────────────────────────────────────────────────────────
+# ── SCAN 1 — Pre-market TOP 5 (7:45 AM) ───────────────────────────────────────
 
-async def _run_off_hours_scan(event_name: str,
-                               alert_threshold: int, label: str,
-                               daily_log: list):
-    tickers = wl.load()
-    print(f"\n{'─'*50}")
-    print(f"⏰ [{label}] Scanning {len(tickers)} tickers...")
+async def _scan1_premarket_top5():
+    """
+    7:45 AM Mon–Fri.
+    Runs the broad pre-market scan, filters for fresh catalysts, and sends a
+    '📊 PRE-MARKET TOP 5' WhatsApp digest.
+    Results are cached in _scan1_results for Scan 2 to re-check at 9:45 AM.
+    """
+    global _scan1_results
+    print("\n" + "─" * 50)
+    print("🌅 [7:45 AM] SCAN 1 — Pre-market TOP 5 starting...")
 
-    fired_count = 0
-    for i, ticker in enumerate(tickers):
-        if i > 0:
-            await asyncio.sleep(20)   # Polygon rate limit buffer
+    loop = asyncio.get_running_loop()
+    try:
+        from premarket_scanner import run_premarket_scan, _has_news_catalyst
+
+        # Run full broad scan (Claude-enriched): entry/target/stop/catalyst
+        candidates: list = await loop.run_in_executor(
+            _executor,
+            lambda: run_premarket_scan(
+                mode="broad", test=False, verbose=False, save_prep=True
+            ),
+        )
+    except Exception as e:
+        print(f"❌ [7:45 AM] Pre-market scan error: {e}")
+        send_whatsapp("📊 PRE-MARKET TOP 5: Scan failed — check logs.")
+        return
+
+    # Prefer catalysts; fall back to all candidates if none have one
+    with_catalyst = [c for c in candidates if _has_news_catalyst(c)]
+    pool = with_catalyst if with_catalyst else candidates
+
+    # Sort by score descending and cache for Scan 2
+    pool.sort(key=lambda x: x.get("score", 0), reverse=True)
+    _scan1_results = pool[:10]   # keep up to 10 for Scan 2 re-check
+
+    top5 = pool[:5]
+    if not top5:
+        send_whatsapp("📊 PRE-MARKET TOP 5: No qualifying setups today.")
+        print("💤 [7:45 AM] No pre-market candidates qualify.")
+        return
+
+    _SEP = "─" * 33
+    lines = [f"📊 PRE-MARKET TOP 5\n{_SEP}"]
+    for i, c in enumerate(top5, 1):
+        pm_price   = c.get("premarket_price", 0)
+        entry_low  = c.get("entry_low",  pm_price * 0.99)
+        target_1   = c.get("target_1", 0)
+        stop_loss  = c.get("stop_loss", 0)
+        gap_pct    = c.get("gap_pct", 0)
+
+        # Catalyst label
+        if c.get("is_earnings_beat"):
+            catalyst = "Earnings Beat"
+        elif c.get("is_upgrade"):
+            catalyst = "Analyst Upgrade"
+        elif c.get("has_edgar"):
+            catalyst = "EDGAR Filing"
+        elif c.get("is_contract"):
+            catalyst = "Contract/Deal"
+        elif c.get("news_headline"):
+            catalyst = c["news_headline"][:70]
+        else:
+            catalyst = "Technical Setup"
+
+        entry_str  = f"${entry_low:.2f}"
+        target_str = f"${target_1:.2f}" if target_1 > 0 else "—"
+        stop_str   = f"${stop_loss:.2f}" if stop_loss > 0 else "—"
+
+        lines.append(
+            f"{i}. {c['ticker']}  ${pm_price:.2f}  {gap_pct:+.1f}%\n"
+            f"   Entry {entry_str}  T1 {target_str}  Stop {stop_str}\n"
+            f"   📰 {catalyst}"
+        )
+
+    lines.append(_SEP)
+    lines.append("⏰ Market opens 9:30 AM — confirming at 9:45 AM")
+    send_whatsapp("\n".join(lines))
+    print(f"✅ [7:45 AM] Scan 1 sent — {len(top5)} picks, {len(with_catalyst)} with catalyst")
+
+
+# ── SCAN 2 — Opening range confirmed entries (9:45 AM) ────────────────────────
+
+async def _scan2_confirm_entries():
+    """
+    9:45 AM Mon–Fri.
+    Re-checks Scan 1 picks with live prices.
+    Stocks that held ≥80% of their pre-market gap pass to the GRAPH pipeline,
+    which fires individual BUY alerts via alert_node.
+    Sends a '✅ CONFIRMED ENTRIES' summary.
+    """
+    print("\n" + "─" * 50)
+    print("⏰ [9:45 AM] SCAN 2 — Opening range confirmation...")
+
+    if not _is_market_open():
+        print("⚠️  [9:45 AM] Market closed — skipping Scan 2")
+        return
+
+    # Load candidates: prefer in-memory Scan 1 results, fall back to saved prep list
+    candidates = _scan1_results
+    if not candidates:
+        try:
+            from premarket_scanner import _load_prep_list
+            candidates = _load_prep_list()
+        except Exception:
+            pass
+
+    if not candidates:
+        send_whatsapp("✅ CONFIRMED ENTRIES: No pre-market picks to re-check.")
+        return
+
+    import yfinance as yf
+
+    confirmed = []
+    skipped   = []
+
+    for c in candidates[:10]:
+        ticker     = c["ticker"]
+        pm_price   = c.get("premarket_price", 0)
+        prev_close = c.get("prev_close", 0)
+        gap_dollars = pm_price - prev_close   # signed gap
+
+        if abs(gap_dollars) < 0.01 or prev_close <= 0:
+            skipped.append(f"{ticker} (no gap data)")
+            continue
+
+        try:
+            live = float(yf.Ticker(ticker).fast_info["last_price"] or 0)
+            if live <= 0:
+                skipped.append(f"{ticker} (no live price)")
+                continue
+        except Exception as e:
+            skipped.append(f"{ticker} ({e})")
+            continue
+
+        # Gap retention: how much of the pre-market gap is still intact
+        gap_retained = (live - prev_close) / gap_dollars if gap_dollars != 0 else 0
+        held = gap_retained >= 0.80
+
+        print(
+            f"   {'✅' if held else '❌'} {ticker}  "
+            f"pm=${pm_price:.2f}  live=${live:.2f}  "
+            f"retained={gap_retained*100:.0f}%"
+        )
+
+        if held:
+            confirmed.append({**c, "live_price": live, "gap_retained": gap_retained})
+
+    # Fire BUY alerts for confirmed tickers via full pipeline
+    results = []
+    for c in confirmed[:5]:
+        ticker = c["ticker"]
         try:
             result = await _run_ticker(ticker)
-            conf   = result.get("confidence", 0)
-            sig    = result.get("signal", "HOLD")
-            price  = result.get("current_price", 0.0)
-
-            if sig in ("BUY", "SELL") and conf >= alert_threshold:
-                emoji = "🟢 BUY" if sig == "BUY" else "🔴 SELL"
-                msg = (
-                    f"{label} ALERT\n"
-                    f"{emoji} {ticker} — score {conf}/100\n"
-                    f"${price:.2f} | RSI {result.get('rsi', 0):.0f}\n"
-                    f"Entry: {result.get('entry_zone', '—')}\n"
-                    f"Target: ${result.get('targets', [0])[0]:.2f} | "
-                    f"Stop: ${result.get('stop_loss', 0):.2f}\n"
-                    f"{result.get('reasoning', '')[:200]}"
-                )
-                send_whatsapp(msg)
-                fired_count += 1
-
+            results.append({
+                "ticker":       ticker,
+                "live":         c["live_price"],
+                "gap_retained": c["gap_retained"],
+                "signal":       result.get("signal", "HOLD"),
+                "confidence":   result.get("confidence", 0),
+                "alert_sent":   result.get("alert_sent", False),
+            })
         except Exception as e:
-            print(f"❌ [{label}] Error on {ticker}: {e}")
+            print(f"❌ [9:45 AM] Pipeline error for {ticker}: {e}")
 
-    if fired_count == 0:
-        print(f"💤 [{label}] No signals >= {alert_threshold} confidence. Silent.")
-    print(f"{'─'*50}\n")
+    # Build summary WhatsApp
+    _SEP = "─" * 33
+    lines = [f"✅ CONFIRMED ENTRIES\n{_SEP}"]
 
-
-async def _run_morning_sweep():
-    """
-    7:45 AM — Best-of-Day selection pipeline.
-    Pre-seeds universe with pre-market gappers (daily RVOL is ~0 before open,
-    so we collect candidates from the premarket scanner first and prepend them
-    so they survive Gate 1 ahead of the bulk universe).
-    Runs gate filtering → scoring → Claude ranking → WhatsApp (handled internally).
-    Takes ~10–15 min due to bulk download + Polygon news rate limits.
-    """
-    global _sweep_results
-    print("\n⏰ [7:45 AM] Starting Best-of-Day selection pipeline...")
-    watchlist = wl.load()
-
-    # ── Heartbeat: confirm agent is alive before the scan begins ──────────────
-    try:
-        import world_context as wctx
-        ctx      = wctx.get()
-        macro    = ctx["macro"]
-        earnings = ctx["earnings"]
-        vix_str  = f"VIX {macro.get('vix', 0):.1f}" if macro.get("vix") else "VIX —"
-        spy_str  = f"SPY {macro.get('bias', '?')}"
-        hot_str  = ""
-        today_earns = [
-            e["ticker"] for e in earnings.get("upcoming", []) if e.get("days", 99) <= 1
-        ]
-        if today_earns:
-            hot_str = f"\nEarnings today: {', '.join(today_earns)}"
-        hb_msg = (
-            f"⏰ Argus is awake (7:45 AM EST)\n"
-            f"{spy_str}  |  {vix_str}\n"
-            f"Watchlist: {', '.join(watchlist)}"
-            f"{hot_str}\n"
-            f"Running Best-of-Day scan now... 🔍"
-        )
-        from alerts import send_whatsapp
-        send_whatsapp(hb_msg)
-    except Exception as _hb_err:
-        print(f"⚠️  [7:45 AM] Heartbeat failed: {_hb_err}")
-
-    # Collect pre-market gappers to prioritise them (daily volume bars
-    # are empty before 9:30 AM, so RVOL would be ~0 for every stock).
-    premarket_priority: list = []
-    try:
-        from premarket_scanner import scan_premarket_gaps
-        gaps = scan_premarket_gaps(watchlist)
-        premarket_priority = [g["ticker"] for g in gaps if g["gap_pct"] >= 2.0]
-        if premarket_priority:
-            print(f"⚡ [7:45 AM] Pre-market gappers to prioritise: {premarket_priority}")
-    except Exception as _e:
-        print(f"⚠️  [7:45 AM] Pre-market scan skipped: {_e}")
-
-    extra = list(dict.fromkeys(premarket_priority + watchlist))
-    loop  = asyncio.get_running_loop()
-    result = await loop.run_in_executor(
-        _executor,
-        lambda: scan_best_of_day(
-            verbose=False,
-            extra_tickers=extra,
-            min_score=75,          # lower threshold at 7:45 AM
-            rvol_bypass=premarket_priority,  # skip Gate 1 for known gappers
-        ),
-    )
-    # Store winner as single-item list so _send_market_opens_soon can reference it
-    _sweep_results = [result] if result else []
-    top = result.get("ticker", "—") if result else "—"
-    print(f"✅ [7:45 AM] Best-of-Day complete. Winner: {top}")
-
-
-async def _run_early_gap_check(hour: int, minute: int,
-                               mode: str = "quick", gap_threshold: float = 3.0):
-    """
-    Quick gap scan on watchlist — fires only for large movers (gap ≥ gap_threshold).
-    Used at 4 AM, 6 AM.
-    """
-    label = f"{hour}:{minute:02d} AM"
-    print(f"\n{'─'*50}")
-    print(f"⚡ [{label}] Early gap check (mode={mode}, threshold={gap_threshold}%)...")
-    try:
-        from premarket_scanner import scan_premarket_gaps, format_premarket_msg
-        import watchlist_manager as _wl
-        tickers = _wl.load()
-        if mode == "broad":
-            try:
-                from market_scanner import _load_universe
-                universe = _load_universe() or []
-                tickers  = list(dict.fromkeys(tickers + universe[:50]))
-            except Exception:
-                pass
-
-        loop = asyncio.get_running_loop()
-        gaps = await loop.run_in_executor(_executor, scan_premarket_gaps, tickers)
-        big  = [g for g in gaps if g["gap_pct"] >= gap_threshold]
-        if big:
-            msg = format_premarket_msg(big[:3])
-            print(f"🔔 [{label}] {len(big)} big mover(s) found:\n{msg}")
-            send_whatsapp(msg)
-        else:
-            print(f"💤 [{label}] No movers ≥ {gap_threshold}% yet.")
-    except Exception as e:
-        print(f"❌ [{label}] Gap check error: {e}")
-
-
-async def _run_premarket_scan():
-    """8:30 AM — scan for pre-market gap movers and alert via WhatsApp."""
-    print(f"\n{'─'*50}")
-    print("⚡ [8:30 AM] Running pre-market gap scanner...")
-    try:
-        from premarket_scanner import scan_premarket_gaps, format_premarket_msg
-        import main as _main
-        tickers = list(dict.fromkeys(wl.load()))  # watchlist first
-        loop    = asyncio.get_running_loop()
-        gaps    = await loop.run_in_executor(_executor, scan_premarket_gaps, tickers)
-        # Store in main.py's cache so the dashboard can show it
-        _main._premarket_cache.update({
-            "gaps":       gaps[:10],
-            "scanned_at": datetime.now(tz=EST).strftime("%H:%M:%S"),
-            "count":      len(gaps),
-        })
-        if gaps:
-            msg = format_premarket_msg(gaps[:3])
-            print(f"✅ [8:30 AM] {len(gaps)} gap(s) found:\n{msg}")
-            send_whatsapp(msg)
-        else:
-            print("✅ [8:30 AM] No qualifying pre-market gaps today.")
-    except Exception as e:
-        print(f"❌ [8:30 AM] Pre-market scan error: {e}")
-
-
-async def _run_morning_digest():
-    """8:00 AM — WhatsApp morning digest: movers + macro + today's picks."""
-    print(f"\n{'─'*50}")
-    print("☀️  [8:00 AM] Sending morning digest...")
-    try:
-        from premarket_scanner import send_morning_digest
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(_executor, send_morning_digest)
-    except Exception as e:
-        print(f"❌ [8:00 AM] Morning digest error: {e}")
-
-
-async def _run_broad_premarket_scan():
-    """8:45 AM — Full broad pre-market scan with Claude analysis."""
-    print(f"\n{'─'*50}")
-    print("🌅 [8:45 AM] Running broad pre-market scan (Claude analysis)...")
-    try:
-        from premarket_scanner import run_premarket_scan
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            _executor,
-            lambda: run_premarket_scan(mode="broad", test=False, verbose=False, save_prep=True),
-        )
-    except Exception as e:
-        print(f"❌ [8:45 AM] Broad pre-market scan error: {e}")
-
-
-async def _run_prep_alert():
-    """9:10 AM — Final prep scan + save prep_alert_list.json + send PREP alerts."""
-    print(f"\n{'─'*50}")
-    print("🎯 [9:10 AM] Running PREP alert scan...")
-    try:
-        from premarket_scanner import run_premarket_scan
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            _executor,
-            lambda: run_premarket_scan(mode="broad", test=False, verbose=False, save_prep=True),
-        )
-    except Exception as e:
-        print(f"❌ [9:10 AM] Prep alert error: {e}")
-
-
-async def _run_confirmation_alert():
-    """9:25 AM — Re-check prep list → STILL BUY / WEAKENED / STAND DOWN."""
-    print(f"\n{'─'*50}")
-    print("⏰ [9:25 AM] Running pre-market confirmation check...")
-    try:
-        from premarket_scanner import run_confirmation_check
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(
-            _executor,
-            lambda: run_confirmation_check(test=False, verbose=False),
-        )
-    except Exception as e:
-        print(f"❌ [9:25 AM] Confirmation check error: {e}")
-
-
-async def _send_market_opens_soon():
-    """Fallback 9:25 AM message used only if confirmation check is skipped."""
-    top = _sweep_results[:2] if _sweep_results else []
-    watch_lines = "\n".join(
-        f"- {r['ticker']} ${r['price']:.2f} (score {r['score']})"
-        for r in top
-    ) or "- " + ", ".join(wl.load())
-
-    msg = (
-        f"⏰ Market opens in 5 min (9:30 AM EST)\n\n"
-        f"Top watch today:\n{watch_lines}\n\n"
-        f"Stay sharp! 👀"
-    )
-    send_whatsapp(msg)
-
-
-async def _send_market_closed(daily_log: list, signal_memory: dict):
-    today  = _today()
-    sigs   = [e for e in daily_log if e.get("timestamp", "")[:10] == today]
-
-    lines  = ["🔔 Market closed (4:00 PM EST)\n"]
-    if sigs:
-        lines.append(f"Signals fired today: {len(sigs)}")
-        for s in sigs:
-            icon = "🟢" if s["signal"] == "BUY" else "🔴"
-            t    = s.get("timestamp", "")[-8:-3]
-            lines.append(f"  {icon} {s['signal']} {s['ticker']} @ ${s['price']:.2f}  conf={s['confidence']}  {t}")
+    if not results:
+        lines.append("0 stocks held their gap. Standing down.")
     else:
-        lines.append("No BUY/SELL signals fired today.")
+        for r in results:
+            icon  = "🟢" if r["signal"] == "BUY" else "⚡"
+            alert = "→ ALERT SENT" if r["alert_sent"] else ""
+            lines.append(
+                f"{icon} {r['ticker']}  ${r['live']:.2f}  "
+                f"Gap held {r['gap_retained']*100:.0f}%  "
+                f"conf={r['confidence']:.0f}  {alert}".rstrip()
+            )
 
-    if signal_memory:
-        lines.append("\nOpen positions:")
-        for ticker, m in signal_memory.items():
-            lines.append(f"  {m['signal']} {ticker} @ ${m['price']:.2f} | SL ${m['stop_loss']:.2f}")
+    if skipped:
+        lines.append(f"\nSkipped: {', '.join(skipped[:5])}")
 
-    msg = "\n".join(lines)
-    send_whatsapp(msg)
+    lines.append(_SEP)
+    send_whatsapp("\n".join(lines))
+    confirmed_buys = sum(1 for r in results if r["signal"] == "BUY")
+    print(f"✅ [9:45 AM] Scan 2 done — {len(confirmed)}/{len(candidates)} held gap, {confirmed_buys} BUY alerts")
 
 
-async def _send_daily_report(daily_log: list):
-    today  = _today()
-    sigs   = [e for e in daily_log if e.get("timestamp", "")[:10] == today]
+# ── SCAN 3 — Power hour momentum (2:00 PM) ────────────────────────────────────
 
-    lines  = [f"📊 Daily Report — {today}\n"]
+def _fetch_intraday_momentum(ticker: str) -> Optional[dict]:
+    """
+    Fetch intraday data and return a momentum dict if the stock qualifies:
+    day_chg between +3% and +8%, building volume over the last 30 min.
+    Returns None if it doesn't qualify or data is unavailable.
+    """
+    try:
+        import yfinance as yf
+        import numpy as np
+
+        t    = yf.Ticker(ticker)
+        hist = t.history(period="1d", interval="5m")
+        if hist is None or hist.empty or len(hist) < 10:
+            return None
+
+        prev_close = float(t.fast_info.get("previous_close") or 0)
+        if prev_close <= 0:
+            return None
+
+        current   = float(hist["Close"].iloc[-1])
+        day_high  = float(hist["High"].max())
+        day_chg   = (current - prev_close) / prev_close * 100
+
+        if not (3.0 <= day_chg <= 8.0):
+            return None
+
+        # Relative volume: project today's partial volume to full day
+        # At 2 PM ET we're 4.5h into the 6.5h session
+        today_vol = int(hist["Volume"].sum())
+        avg_vol   = float(t.fast_info.get("three_month_average_volume") or 0)
+        time_adj  = 6.5 / 4.5
+        projected_rvol = (today_vol * time_adj / avg_vol) if avg_vol > 0 else 0
+
+        # Volume building: last 6 bars vs prior 6 bars (30-min window each)
+        if len(hist) >= 12:
+            recent_vol = float(hist["Volume"].iloc[-6:].mean())
+            prior_vol  = float(hist["Volume"].iloc[-12:-6].mean())
+            building   = prior_vol > 0 and recent_vol > prior_vol * 1.15
+        else:
+            building = False
+
+        # Near session high (within 3%)
+        near_high = current >= day_high * 0.97
+
+        # Composite score: weight day change + rvol + building + near_high
+        score = (
+            min(day_chg, 8.0) * 5        # 0-40
+            + min(projected_rvol, 5.0) * 6  # 0-30
+            + (15 if building else 0)
+            + (15 if near_high else 0)
+        )
+
+        return {
+            "ticker":    ticker,
+            "price":     round(current, 4),
+            "day_chg":   round(day_chg, 2),
+            "rvol":      round(projected_rvol, 2),
+            "building":  building,
+            "near_high": near_high,
+            "score":     round(score, 1),
+        }
+    except Exception:
+        return None
+
+
+async def _scan3_power_hour():
+    """
+    2:00 PM Mon–Fri.
+    Scans the full dynamic ticker universe for intraday momentum (up 3-8%,
+    building volume).  Sends a '🔜 TOMORROW'S SETUPS' WhatsApp digest.
+    """
+    print("\n" + "─" * 50)
+    print("🔜 [2:00 PM] SCAN 3 — Power hour momentum scan starting...")
+
+    if not _is_market_open():
+        print("⚠️  [2:00 PM] Market closed — skipping Scan 3")
+        return
+
+    # Pull from the same dynamic scan list used by main.py
+    try:
+        from main import build_scan_list
+        tickers = build_scan_list()
+    except Exception:
+        # Fallback: top movers
+        try:
+            from top_movers import get_top_movers
+            tickers = get_top_movers()
+        except Exception as e:
+            print(f"❌ [2:00 PM] Could not build ticker list: {e}")
+            return
+
+    print(f"   Scanning {len(tickers)} tickers for intraday momentum...")
+
+    # Parallel fetch — I/O bound, use thread pool
+    from concurrent.futures import ThreadPoolExecutor, as_completed
+    hits: list = []
+    with ThreadPoolExecutor(max_workers=8) as exe:
+        futs = {exe.submit(_fetch_intraday_momentum, t): t for t in tickers}
+        for fut in as_completed(futs):
+            result = fut.result()
+            if result:
+                hits.append(result)
+
+    hits.sort(key=lambda x: x["score"], reverse=True)
+    top = hits[:5]
+
+    if not top:
+        send_whatsapp(
+            "🔜 TOMORROW'S SETUPS (2 PM)\nNo intraday momentum setups found today."
+        )
+        print("💤 [2:00 PM] No momentum setups (0 stocks up 3-8% with building volume)")
+        return
+
+    _SEP = "─" * 33
+    lines = [f"🔜 TOMORROW'S SETUPS\n{_SEP}"]
+    for i, h in enumerate(top, 1):
+        vol_tag  = "📈 vol building" if h["building"] else ""
+        high_tag = "near HOD" if h["near_high"] else ""
+        tags     = "  ".join(t for t in [vol_tag, high_tag] if t)
+        lines.append(
+            f"{i}. {h['ticker']}  ${h['price']:.2f}  +{h['day_chg']:.1f}%  "
+            f"RVOL {h['rvol']:.1f}x\n"
+            f"   Score {h['score']:.0f}  {tags}".rstrip()
+        )
+    lines.append(_SEP)
+    lines.append("💡 Swing candidates for tomorrow's open")
+
+    send_whatsapp("\n".join(lines))
+    print(f"✅ [2:00 PM] Scan 3 sent — {len(hits)} momentum stocks, top: {top[0]['ticker']} (+{top[0]['day_chg']:.1f}%)")
+
+
+# ── Exit agent — every 30 min during market hours ─────────────────────────────
+
+async def _exit_agent_check():
+    """
+    Fires every 30 min. Skips if market is closed.
+    Iterates open positions in signal_memory and runs manage_exit() for each.
+    """
+    if not _is_market_open():
+        return
+
+    positions = dict(_signal_memory)   # snapshot to avoid mutation during iteration
+    if not positions:
+        return
+
+    print(f"\n⏰ [Exit check] {len(positions)} open position(s): {list(positions)}")
+
+    from agents.exit_agent import manage_exit
+
+    for ticker, mem in positions.items():
+        entry_price = mem.get("price", 0)
+        entry_date  = mem.get("timestamp")
+        target      = mem.get("targets", [0])[0] if mem.get("targets") else 0
+        stop        = mem.get("stop_loss", 0)
+
+        if not all([entry_price, target, stop]):
+            continue
+
+        try:
+            # manage_exit is async
+            from datetime import datetime as _dt, timezone as _tz
+            if isinstance(entry_date, str):
+                entry_date = _dt.fromisoformat(entry_date)
+            elif entry_date is None:
+                entry_date = _dt.now(_tz.utc)
+
+            result = await manage_exit(
+                ticker=ticker,
+                entry_price=entry_price,
+                entry_date=entry_date,
+                target=target,
+                stop=stop,
+            )
+            sig = result.get("signal", "")
+            if sig in ("SELL", "STOP", "TAKE_PROFIT"):
+                print(f"   🔔 Exit signal for {ticker}: {sig} @ ${result.get('exit_price', 0):.2f}")
+                _signal_memory.pop(ticker, None)
+        except Exception as e:
+            print(f"   ⚠️  Exit check error {ticker}: {e}")
+
+
+# ── 4:15 PM — Daily P&L summary ───────────────────────────────────────────────
+
+async def _send_daily_pnl():
+    """4:15 PM Mon–Fri — reads today's signals from daily_log and SQLite P&L."""
+    print("\n" + "─" * 50)
+    print("📊 [4:15 PM] Daily P&L summary...")
+
+    today = datetime.now(tz=EST).strftime("%Y-%m-%d")
+    sigs  = [e for e in _daily_log if str(e.get("timestamp", ""))[:10] == today]
+
+    lines = [f"📊 Daily P&L — {today}\n"]
     if not sigs:
         lines.append("No BUY/SELL signals fired today.")
     else:
-        lines.append(f"Total signals: {len(sigs)}")
+        lines.append(f"Signals fired: {len(sigs)}")
         for s in sigs:
             icon = "🟢" if s["signal"] == "BUY" else "🔴"
-            lines.append(f"  {icon} {s['signal']} {s['ticker']} @ ${s['price']:.2f}  conf={s['confidence']}")
+            t    = str(s.get("timestamp", ""))[-8:-3]   # HH:MM
+            lines.append(
+                f"  {icon} {s['signal']} {s['ticker']} @ "
+                f"${s.get('price', 0):.2f}  conf={s.get('confidence', 0):.0f}  {t}"
+            )
 
-    msg = "\n".join(lines)
-    send_whatsapp(msg)
-    print("\n" + "─"*50 + "\n" + msg + "\n" + "─"*50 + "\n")
+    # Quick SQLite win-rate for today
+    try:
+        import performance_tracker as pt
+        stats = pt.get_summary_stats()
+        if isinstance(stats, dict):
+            wr  = stats.get("win_rate_7d", 0) or stats.get("win_rate", 0)
+            cnt = stats.get("trade_count_7d", 0) or stats.get("total", 0)
+            if wr:
+                lines.append(f"\n7d win-rate: {wr:.0f}%  ({cnt} trades)")
+    except Exception:
+        pass
+
+    # Open positions
+    if _signal_memory:
+        lines.append("\nOpen positions:")
+        for ticker, m in _signal_memory.items():
+            lines.append(
+                f"  {m.get('signal','?')} {ticker} @ "
+                f"${m.get('price', 0):.2f}  SL ${m.get('stop_loss', 0):.2f}"
+            )
+
+    send_whatsapp("\n".join(lines))
+    print("✅ [4:15 PM] Daily P&L sent.")
 
 
-async def _send_good_night(daily_log: list):
-    today = _today()
-    sigs  = [e for e in daily_log if e.get("timestamp", "")[:10] == today]
-    msg   = (
-        f"🌙 Good night! Argus going to sleep.\n\n"
-        f"Today's summary:\n"
-        f"- Signals fired: {len(sigs)}\n"
-        f"- Scans completed: {sum(1 for v in _fired_today.values() if v == today)}\n\n"
-        f"Agent continues running overnight.\nSleep well! 😴"
+# ── Sunday 7 PM — Weekly eval ─────────────────────────────────────────────────
+
+async def _weekly_eval():
+    """Sunday 7:00 PM — run the eval agent."""
+    print("\n" + "─" * 50)
+    print("📋 [Sun 7 PM] Weekly eval starting...")
+    loop = asyncio.get_running_loop()
+    try:
+        from agents.eval_agent import run_weekly_eval
+        await loop.run_in_executor(_executor, run_weekly_eval)
+    except Exception as e:
+        print(f"❌ [Sun 7 PM] Weekly eval error: {e}")
+
+
+# ── Hub daily reset (3 AM) ────────────────────────────────────────────────────
+
+async def _daily_reset():
+    """3:00 AM Mon–Fri — reset alert dedup so each ticker can fire once per day."""
+    print("🔄 [3:00 AM] Daily hub reset")
+    hub.reset_daily()
+
+
+# ── Scheduler factory ─────────────────────────────────────────────────────────
+
+def _build_scheduler() -> AsyncIOScheduler:
+    TZ  = "America/New_York"
+    WD  = "mon-fri"
+    kw  = dict(timezone=TZ, misfire_grace_time=600, coalesce=True)
+
+    sched = AsyncIOScheduler(timezone=TZ)
+
+    # Daily hub reset (3 AM every day)
+    sched.add_job(
+        _daily_reset,
+        CronTrigger(hour=3, minute=0, timezone=TZ),
+        id="daily_reset", replace_existing=True, **{k: v for k, v in kw.items() if k != "timezone"},
     )
-    send_whatsapp(msg)
-    print("🌙 [Scheduler] Good night — daily schedule complete.")
+
+    # SCAN 1 — 7:45 AM Mon–Fri
+    sched.add_job(
+        _scan1_premarket_top5,
+        CronTrigger(day_of_week=WD, hour=7, minute=45, timezone=TZ),
+        id="scan1_premarket", replace_existing=True,
+        misfire_grace_time=600, coalesce=True,
+    )
+
+    # SCAN 2 — 9:45 AM Mon–Fri
+    sched.add_job(
+        _scan2_confirm_entries,
+        CronTrigger(day_of_week=WD, hour=9, minute=45, timezone=TZ),
+        id="scan2_opening_range", replace_existing=True,
+        misfire_grace_time=300, coalesce=True,
+    )
+
+    # SCAN 3 — 2:00 PM Mon–Fri
+    sched.add_job(
+        _scan3_power_hour,
+        CronTrigger(day_of_week=WD, hour=14, minute=0, timezone=TZ),
+        id="scan3_power_hour", replace_existing=True,
+        misfire_grace_time=600, coalesce=True,
+    )
+
+    # Exit agent — every 30 min on the hour/half-hour, Mon–Fri
+    sched.add_job(
+        _exit_agent_check,
+        CronTrigger(day_of_week=WD, hour="9-15", minute="0,30", timezone=TZ),
+        id="exit_check", replace_existing=True,
+        misfire_grace_time=120, coalesce=True,
+    )
+
+    # 4:15 PM P&L summary — Mon–Fri
+    sched.add_job(
+        _send_daily_pnl,
+        CronTrigger(day_of_week=WD, hour=16, minute=15, timezone=TZ),
+        id="daily_pnl", replace_existing=True,
+        misfire_grace_time=600, coalesce=True,
+    )
+
+    # Sunday 7 PM weekly eval
+    sched.add_job(
+        _weekly_eval,
+        CronTrigger(day_of_week="sun", hour=19, minute=0, timezone=TZ),
+        id="weekly_eval", replace_existing=True,
+        misfire_grace_time=1800, coalesce=True,
+    )
+
+    return sched
 
 
-# ── Main scheduler loop ────────────────────────────────────────────────────────
+# ── Entry point (called by main.py) ───────────────────────────────────────────
 
 async def scheduler_loop(daily_log: list, signal_memory: dict):
-    print("🗓️  [Scheduler] Started — polling every 30s")
-    while True:
-        try:
-            now     = datetime.now(tz=EST)
-            weekday = now.weekday() < 5   # Mon–Fri
+    """
+    Main entry point — called via asyncio.create_task() from main.py lifespan.
+    Stores shared state references, builds + starts the APScheduler, then
+    waits indefinitely (until the task is cancelled on shutdown).
+    """
+    global _daily_log, _signal_memory
+    _daily_log     = daily_log
+    _signal_memory = signal_memory
 
-            # ── 3:00 AM — Overnight scan (every day) + daily hub reset
-            if _in_window(3, 0) and _should_fire("overnight_news"):
-                _mark_fired("overnight_news")
-                hub.reset_daily()   # clear alert dedup so each ticker can fire once today
-                await _run_off_hours_scan(
-                    "overnight_news",
-                    alert_threshold=85,
-                    label="3:00 AM OVERNIGHT",
-                    daily_log=daily_log,
-                )
+    sched = _build_scheduler()
+    sched.start()
 
-            # ── 4:00 AM — Early gap check (watchlist, big movers ≥ 5%)
-            if weekday and _in_window(4, 0) and _should_fire("early_gap_4am"):
-                _mark_fired("early_gap_4am")
-                await _run_early_gap_check(4, 0, mode="quick", gap_threshold=5.0)
+    now = datetime.now(tz=EST)
+    print(
+        f"🗓️  [Scheduler] APScheduler started  "
+        f"{now.strftime('%Y-%m-%d %H:%M %Z')}\n"
+        f"   Jobs: {', '.join(j.id for j in sched.get_jobs())}"
+    )
 
-            # ── 6:00 AM — Broader gap check (watchlist + universe[:50])
-            if weekday and _in_window(6, 0) and _should_fire("early_gap_6am"):
-                _mark_fired("early_gap_6am")
-                await _run_early_gap_check(6, 0, mode="broad", gap_threshold=3.0)
-
-            # ── 7:30 AM — Quick Claude scan on watchlist gappers
-            if weekday and _in_window(7, 30) and _should_fire("quick_pm_scan_730"):
-                _mark_fired("quick_pm_scan_730")
-                try:
-                    from premarket_scanner import run_premarket_scan
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(
-                        _executor,
-                        lambda: run_premarket_scan(mode="quick", test=False, verbose=False, save_prep=False),
-                    )
-                except Exception as _e:
-                    print(f"❌ [7:30 AM] Quick pre-market scan error: {_e}")
-
-            # ── 7:45 AM — Best-of-Day selection (includes WhatsApp send)
-            if weekday and _in_window(7, 45) and _should_fire("morning_sweep"):
-                _mark_fired("morning_sweep")
-                await _run_morning_sweep()
-
-            # ── 8:00 AM — Morning digest
-            if weekday and _in_window(8, 0) and _should_fire("morning_digest"):
-                _mark_fired("morning_digest")
-                await _run_morning_digest()
-
-            # ── 8:30 AM — Pre-market gap scan (dashboard cache)
-            if weekday and _in_window(8, 30) and _should_fire("premarket_gaps"):
-                _mark_fired("premarket_gaps")
-                await _run_premarket_scan()
-
-            # ── 8:45 AM — Broad pre-market scan with Claude analysis
-            if weekday and _in_window(8, 45) and _should_fire("broad_pm_scan"):
-                _mark_fired("broad_pm_scan")
-                await _run_broad_premarket_scan()
-
-            # ── 9:10 AM — Final PREP alert (save prep_alert_list.json)
-            if weekday and _in_window(9, 10) and _should_fire("prep_alert"):
-                _mark_fired("prep_alert")
-                await _run_prep_alert()
-
-            # ── 9:25 AM — Confirmation check (STILL BUY / WEAKENED / STAND DOWN)
-            if weekday and _in_window(9, 25) and _should_fire("market_opens_soon"):
-                _mark_fired("market_opens_soon")
-                await _run_confirmation_alert()
-
-            # ── 3:30 PM — EOD pre-close scan (accumulation / coiling / bounce)
-            if weekday and _in_window(15, 30) and _should_fire("eod_preclose"):
-                _mark_fired("eod_preclose")
-                try:
-                    from eod_scanner import run_preclose_scan
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(_executor, lambda: run_preclose_scan(test=False))
-                except Exception as _e:
-                    print(f"❌ [3:30 PM] EOD pre-close error: {_e}")
-
-            # ── 4:00 PM — Market closed
-            if weekday and _in_window(16, 0) and _should_fire("market_closed"):
-                _mark_fired("market_closed")
-                await _send_market_closed(daily_log, signal_memory)
-
-            # ── 4:15 PM — EOD after-close (earnings releases + EDGAR 8-Ks)
-            if weekday and _in_window(16, 15) and _should_fire("eod_afterclose"):
-                _mark_fired("eod_afterclose")
-                try:
-                    from eod_scanner import run_afterclose_scan
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(_executor, lambda: run_afterclose_scan(test=False))
-                except Exception as _e:
-                    print(f"❌ [4:15 PM] EOD after-close error: {_e}")
-
-            # ── 4:30 PM — Daily report
-            if weekday and _in_window(16, 30) and _should_fire("daily_report"):
-                _mark_fired("daily_report")
-                await _send_daily_report(daily_log)
-
-            # ── 6:00 PM — EOD evening scan (AH prices + news finalization)
-            if weekday and _in_window(18, 0) and _should_fire("eod_evening"):
-                _mark_fired("eod_evening")
-                try:
-                    from eod_scanner import run_evening_scan
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(_executor, lambda: run_evening_scan(test=False))
-                except Exception as _e:
-                    print(f"❌ [6:00 PM] EOD evening scan error: {_e}")
-
-            # ── 8:00 PM — EOD final overnight check
-            if weekday and _in_window(20, 0) and _should_fire("eod_final"):
-                _mark_fired("eod_final")
-                try:
-                    from eod_scanner import run_final_overnight
-                    loop = asyncio.get_running_loop()
-                    await loop.run_in_executor(_executor, lambda: run_final_overnight(test=False))
-                except Exception as _e:
-                    print(f"❌ [8:00 PM] EOD final overnight error: {_e}")
-
-            # ── 10:00 PM — Final scan
-            if weekday and _in_window(22, 0) and _should_fire("final_scan"):
-                _mark_fired("final_scan")
-                await _run_off_hours_scan(
-                    "final_scan",
-                    alert_threshold=85,
-                    label="10:00 PM FINAL",
-                    daily_log=daily_log,
-                )
-
-            # ── 11:00 PM — Good night + shutdown
-            if weekday and _in_window(23, 0) and _should_fire("good_night"):
-                _mark_fired("good_night")
-                await _send_good_night(daily_log)
-                return
-
-        except Exception as e:
-            print(f"❌ [Scheduler] Loop error: {e}")
-
-        await asyncio.sleep(30)
+    try:
+        # Run until cancelled (main.py shutdown)
+        await asyncio.Event().wait()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        sched.shutdown(wait=False)
+        print("🗓️  [Scheduler] Stopped.")

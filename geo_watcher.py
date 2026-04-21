@@ -19,6 +19,9 @@ import json
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
+from zoneinfo import ZoneInfo
+
+_EST = ZoneInfo("America/New_York")
 
 import requests
 import anthropic
@@ -40,6 +43,7 @@ RSS_FEEDS = [
 ]
 
 _seen_guids: set = set()
+_alerted_catalyst_themes: set = set()
 _client: anthropic.Anthropic | None = None
 
 
@@ -147,6 +151,9 @@ Instructions:
 2. For each meaningful headline, identify affected sectors using ETF tickers (XLK, XLE, XLF, XLV, XLY, XLP, XLI, XLRE, XLB, XLU, XLC) or stock tickers if specific
 3. Determine direction: BULLISH or BEARISH for those sectors
 4. Rate magnitude: low / medium / high
+5. Identify any THEMED SUB-SECTOR catalysts (e.g. quantum computing breakthrough, FDA approval, crypto regulation). For each, rate score 1-10 and list the specific stocks most likely to move. Only include themes with score >= 5.
+
+Available themes: quantum_computing, ai_infrastructure, biotech_fda, ev_automotive, crypto_blockchain, energy_oil, defense_aerospace, semiconductors, clean_energy, fintech, space, cybersecurity
 
 Then provide overall market assessment.
 
@@ -164,10 +171,20 @@ Respond ONLY with valid JSON, no markdown:
   "overall_bias": "NEUTRAL",
   "hot_sectors": ["XLE", "XLV"],
   "cold_sectors": ["XLK"],
-  "risk_summary": "two sentences summarizing key risks and opportunities right now"
+  "risk_summary": "two sentences summarizing key risks and opportunities right now",
+  "sector_catalysts": [
+    {{
+      "theme": "quantum_computing",
+      "display_name": "Quantum Computing",
+      "tickers": ["IONQ", "RGTI", "QBTS"],
+      "score": 9,
+      "direction": "BULLISH",
+      "headline": "short catalyst headline"
+    }}
+  ]
 }}
 
-If no headlines have meaningful market impact, return: {{"events": [], "overall_bias": "NEUTRAL", "hot_sectors": [], "cold_sectors": [], "risk_summary": "No major market-moving events in current news cycle."}}"""
+If no headlines have meaningful market impact, return: {{"events": [], "overall_bias": "NEUTRAL", "hot_sectors": [], "cold_sectors": [], "risk_summary": "No major market-moving events in current news cycle.", "sector_catalysts": []}}"""
 
     try:
         response = _get_client().messages.create(
@@ -210,28 +227,62 @@ def _run_sweep() -> bool:
     if not result:
         return False
 
-    events       = result.get("events", [])
-    overall_bias = result.get("overall_bias", "NEUTRAL")
-    hot_sectors  = result.get("hot_sectors", [])
-    cold_sectors = result.get("cold_sectors", [])
-    risk_summary = result.get("risk_summary", "")
+    events            = result.get("events", [])
+    overall_bias      = result.get("overall_bias", "NEUTRAL")
+    hot_sectors       = result.get("hot_sectors", [])
+    cold_sectors      = result.get("cold_sectors", [])
+    risk_summary      = result.get("risk_summary", "")
+    sector_catalysts  = result.get("sector_catalysts", [])
 
     wctx.update_geo({
-        "events":       events,
-        "overall_bias": overall_bias,
-        "hot_sectors":  hot_sectors,
-        "cold_sectors": cold_sectors,
-        "risk_summary": risk_summary,
+        "events":           events,
+        "overall_bias":     overall_bias,
+        "hot_sectors":      hot_sectors,
+        "cold_sectors":     cold_sectors,
+        "risk_summary":     risk_summary,
+        "sector_catalysts": sector_catalysts,
     })
 
     bias_icon = "🟢" if overall_bias == "BULLISH" else "🔴" if overall_bias == "BEARISH" else "🟡"
     print(f"🌍 [GeoAgent] {bias_icon} Bias={overall_bias}  "
           f"Hot={','.join(hot_sectors) or 'none'}  Cold={','.join(cold_sectors) or 'none'}")
     print(f"🌍 [GeoAgent] {len(events)} market-moving event(s) extracted")
+    if sector_catalysts:
+        print(f"🌍 [GeoAgent] {len(sector_catalysts)} sector catalyst(s): "
+              f"{', '.join(c['display_name'] for c in sector_catalysts)}")
     if risk_summary:
         print(f"🌍 [GeoAgent] {risk_summary[:100]}")
 
+    _maybe_alert_catalysts(sector_catalysts)
     return True
+
+
+def _maybe_alert_catalysts(catalysts: list) -> None:
+    """Fire an immediate WhatsApp for any new BULLISH catalyst with score >= 7."""
+    hot = [
+        c for c in catalysts
+        if c.get("score", 0) >= 7
+        and c.get("direction") == "BULLISH"
+        and c.get("theme") not in _alerted_catalyst_themes
+    ]
+    if not hot:
+        return
+    try:
+        from alerts import send_whatsapp
+        for cat in hot[:2]:
+            _alerted_catalyst_themes.add(cat["theme"])
+            score       = cat["score"]
+            tickers_str = "  ".join(cat["tickers"][:6])
+            msg = (
+                f"🚨 SECTOR CATALYST: {cat['display_name']} {score}/10\n\n"
+                f"📰 {cat['headline'][:80]}\n\n"
+                f"Stocks: {tickers_str}\n"
+                f"⏰ {datetime.now(tz=_EST).strftime('%I:%M %p ET')}"
+            )
+            send_whatsapp(msg)
+            print(f"🌍 [GeoAgent] 🚨 Catalyst alert sent: {cat['display_name']} {score}/10")
+    except Exception as e:
+        print(f"⚠️  [GeoAgent] Catalyst alert failed: {e}")
 
 
 # ── Main loop ──────────────────────────────────────────────────────────────────
@@ -286,5 +337,11 @@ if __name__ == "__main__":
         print(f"  {icon} [{','.join(e['sectors'])}] {e['headline'][:70]}")
         print(f"     {e['impact']}")
     print(f"\nRisk Summary: {geo['risk_summary']}")
+    if geo.get("sector_catalysts"):
+        print(f"\nSector Catalysts ({len(geo['sector_catalysts'])}):")
+        for c in geo["sector_catalysts"]:
+            icon = "🟢" if c.get("direction") == "BULLISH" else "🔴"
+            print(f"  {icon} [{c['theme']}] {c['display_name']} score={c['score']}/10 "
+                  f"tickers={c.get('tickers', [])}")
     print(f"\n--- Prompt section preview ---")
     print(wctx.build_prompt_section())

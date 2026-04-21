@@ -10,11 +10,37 @@ alert_reason_code values:
   sent                — alert delivered successfully
 """
 
+import csv
+import os
 from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
 from alerts import send_alert
 import performance_tracker as pt
+from langsmith import traceable
+from utils.tracing import annotate_run
 
-_PRICE_MAX_AGE_S = 90   # re-fetch price if pipeline took longer than this
+_PRICE_MAX_AGE_S  = 90   # re-fetch price if pipeline took longer than this
+_EST              = ZoneInfo("America/New_York")
+_TRADES_LOG       = Path(__file__).parent.parent / "data" / "trades_log.csv"
+_TRADES_LOG_FIELDS = [
+    "ts", "ticker", "signal", "price", "entry_price", "pnl_pct", "outcome",
+]
+
+
+def _append_trades_log(row: dict) -> None:
+    """Append a row to data/trades_log.csv, creating file + header if needed."""
+    try:
+        _TRADES_LOG.parent.mkdir(parents=True, exist_ok=True)
+        write_header = not _TRADES_LOG.exists()
+        with open(_TRADES_LOG, "a", newline="") as f:
+            writer = csv.DictWriter(f, fieldnames=_TRADES_LOG_FIELDS)
+            if write_header:
+                writer.writeheader()
+            writer.writerow(row)
+    except Exception as e:
+        print(f"⚠️  [AlertAgent] trades_log write failed: {e}")
 
 
 def _fresh_price(ticker: str, fetched_at_iso: str, current: float) -> float:
@@ -36,7 +62,9 @@ def _fresh_price(ticker: str, fetched_at_iso: str, current: float) -> float:
         return current
 
 
+@traceable(name="alert_agent", tags=["pipeline", "alert"])
 def alert_node(state: dict) -> dict:
+    annotate_run(state)
     signal        = state.get("signal", "HOLD")
     confidence    = state.get("confidence", 0)
     should_alert  = state.get("should_alert", False)
@@ -46,6 +74,34 @@ def alert_node(state: dict) -> dict:
         state.get("price_fetched_at", ""),
         state.get("current_price", 0.0),
     )
+
+    # ── TAKE_PROFIT — custom path, bypasses regular send_alert ─────────────────
+    if signal == "TAKE_PROFIT" and should_alert:
+        pnl_pct      = state.get("take_profit_pct", 0.0)
+        entry_price  = state.get("take_profit_entry", 0.0)
+        now_str      = datetime.now(tz=_EST).strftime("%I:%M %p ET")
+        msg = (
+            f"💰 TAKE PROFIT {ticker} — +{pnl_pct}% from ${entry_price:.2f}\n\n"
+            f"Current: ${price:.2f}  |  Entry: ${entry_price:.2f}\n"
+            f"⏰ {now_str}"
+        )
+        try:
+            from alerts import send_whatsapp
+            sent = send_whatsapp(msg)
+        except Exception as e:
+            print(f"⚠️  [AlertAgent] TAKE_PROFIT WhatsApp failed: {e}")
+            sent = False
+        _append_trades_log({
+            "ts":          datetime.now().isoformat(),
+            "ticker":      ticker,
+            "signal":      "TAKE_PROFIT",
+            "price":       round(price, 4),
+            "entry_price": round(entry_price, 4),
+            "pnl_pct":     pnl_pct,
+            "outcome":     "WIN",
+        })
+        print(f"💰 [AlertAgent] TAKE PROFIT {ticker} +{pnl_pct}% logged → trades_log.csv")
+        return {**state, "alert_sent": bool(sent), "alert_reason_code": "take_profit"}
 
     # ── Suppress duplicate BUY — position already open ─────────────────────────
     if state.get("already_alerted") and signal == "BUY":
@@ -110,6 +166,14 @@ def alert_node(state: dict) -> dict:
         score_bd  = state.get("score_breakdown", {})
         det_score = score_bd.get("final_score", 0) if isinstance(score_bd, dict) else 0
 
+        # Regime header — "Market: BULL | VIX: 14.2 | SPY: above 20MA & 200MA"
+        try:
+            from utils.regime_gate import regime_header, get_regime
+            _rs = state.get("_regime_state") or get_regime()
+            market_regime_str = regime_header(_rs)
+        except Exception:
+            pass   # market_regime_str already set from world_context above
+
         sent = send_alert(
             ticker=ticker,
             signal=signal,
@@ -133,8 +197,12 @@ def alert_node(state: dict) -> dict:
             market_regime_str=regime_str,
             sector_str=sector_str,
             catalyst_str=catalyst_str,
-            main_risk=state.get("main_risk", ""),
-            det_score=det_score,
+            main_risk    = state.get("main_risk", ""),
+            det_score    = det_score,
+            bull_score   = state.get("bull_score", 0),
+            bear_score   = state.get("bear_score", 0),
+            bull_summary = state.get("bull_summary", ""),
+            bear_summary = state.get("bear_summary", ""),
         )
         if sent:
             print("✅ [AlertAgent] Delivered via WhatsApp + Push")

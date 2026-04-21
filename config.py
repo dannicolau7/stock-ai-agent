@@ -41,4 +41,4 @@ SIGNAL_MAX_AGE_MIN  = int(os.getenv("SIGNAL_MAX_AGE_MIN",  "20"))      # signal 
 # No explicit SDK calls needed; LangGraph picks them up on import.
 LANGCHAIN_TRACING_V2 = os.getenv("LANGCHAIN_TRACING_V2", "false")
 LANGCHAIN_API_KEY    = os.getenv("LANGCHAIN_API_KEY", "")
-LANGCHAIN_PROJECT    = os.getenv("LANGCHAIN_PROJECT", "argus")
+LANGCHAIN_PROJECT    = os.getenv("LANGCHAIN_PROJECT", "stock-ai-agent-production")

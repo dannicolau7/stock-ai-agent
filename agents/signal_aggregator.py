@@ -15,6 +15,8 @@ import time
 from datetime import datetime, timezone
 
 from intelligence_hub import hub
+from langsmith import traceable
+from utils.tracing import annotate_run
 
 # ── Tomorrow-watchlist cache (refresh every 5 min) ─────────────────────────────
 _twl_tickers:     set   = set()
@@ -147,7 +149,9 @@ def _pattern_name(p) -> str:
 
 # ── Main node ──────────────────────────────────────────────────────────────────
 
+@traceable(name="signal_aggregator", tags=["pipeline", "aggregation"])
 def aggregator_node(state: dict) -> dict:
+    annotate_run(state)
     # ── Load hub: reflection weights + regime thresholds ───────────────────────
     hub_weights    = hub.get_reflection_weights()
     thresholds     = hub.get_regime_thresholds()

@@ -104,6 +104,7 @@ def init_db():
         for ddl in (
             "ALTER TABLE signals ADD COLUMN sector TEXT",
             "ALTER TABLE signals ADD COLUMN avg_volume REAL DEFAULT 0",
+            "ALTER TABLE signals ADD COLUMN langsmith_run_id TEXT",
         ):
             try:
                 conn.execute(ddl)
@@ -214,8 +215,9 @@ def record_signal(state: dict) -> int | None:
         "reasoning":      state.get("reasoning", "")[:300],
         "fired_at":       datetime.now().isoformat(),
         "paper":          0,
-        "sector":         state.get("sector", ""),
-        "avg_volume":     state.get("avg_volume", 0.0),
+        "sector":             state.get("sector", ""),
+        "avg_volume":         state.get("avg_volume", 0.0),
+        "langsmith_run_id":   state.get("_langsmith_run_id") or "",
     }
 
     with _get_conn() as conn:
@@ -224,12 +226,12 @@ def record_signal(state: dict) -> int | None:
               (ticker, signal, price, confidence, stop_loss, target_1, target_2,
                trade_horizon, news_triggered, macro_regime, macro_bias, geo_bias,
                market_health, rsi, volume_spike, sentiment, reasoning, fired_at, paper,
-               sector, avg_volume)
+               sector, avg_volume, langsmith_run_id)
             VALUES
               (:ticker, :signal, :price, :confidence, :stop_loss, :target_1, :target_2,
                :trade_horizon, :news_triggered, :macro_regime, :macro_bias, :geo_bias,
                :market_health, :rsi, :volume_spike, :sentiment, :reasoning, :fired_at, :paper,
-               :sector, :avg_volume)
+               :sector, :avg_volume, :langsmith_run_id)
         """, row)
         sig_id = cur.lastrowid
 
@@ -254,7 +256,8 @@ def _fill_outcomes():
     with _get_conn() as conn:
         pending = conn.execute("""
             SELECT o.id, o.signal_id, o.checkpoint,
-                   s.ticker, s.signal, s.price, s.fired_at
+                   s.ticker, s.signal, s.price, s.fired_at,
+                   s.langsmith_run_id
             FROM outcomes o
             JOIN signals s ON s.id = o.signal_id
             WHERE o.win IS NULL
@@ -303,6 +306,19 @@ def _fill_outcomes():
             icon = "✅" if win else "❌"
             print(f"📊 [Tracker] {icon} {ticker} {row['checkpoint']} "
                   f"entry=${entry:.2f} → ${price_at:.2f} ({ret_pct:+.1f}%)  [{row['signal']}]")
+
+            # Auto-flag the originating LangSmith run with the trade outcome
+            try:
+                from utils.tracing import flag_outcome
+                flag_outcome(
+                    run_id=row["langsmith_run_id"] or None,
+                    ticker=ticker,
+                    return_pct=round(ret_pct, 3),
+                    checkpoint=row["checkpoint"],
+                    win=bool(win),
+                )
+            except Exception:
+                pass   # never fail outcome recording over observability
 
 
 def _fetch_close_prices(ticker: str) -> dict:
